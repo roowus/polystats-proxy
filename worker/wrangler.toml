@@ -1,0 +1,7 @@
+name = "polystats-proxy"
+main = "index.ts"
+compatibility_date = "2024-12-01"
+
+# Deployed via Cloudflare Workers Builds (Git integration) or `npx wrangler deploy`.
+# The app expects this worker to be reachable at:
+#   https://polystats-proxy.<your-subdomain>.workers.dev/?url=<encoded api url>
