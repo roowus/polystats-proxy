@@ -9,7 +9,9 @@ S="${PORKBUN_SECRET:?set PORKBUN_SECRET (sk1_...)}"
 
 api() { # endpoint json-extra
   local ep="$1"; shift
-  curl -sS -X POST "https://porkbun.com/api/json/v3/$ep" \
+  curl -sS -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36" \
+    -H "Accept: application/json" \
+    -X POST "https://porkbun.com/api/json/v3/$ep" \
     -H "Content-Type: application/json" \
     -d "{\"apikey\":\"$K\",\"secretkey\":\"$S\"$*}"
 }
