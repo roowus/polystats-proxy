@@ -860,7 +860,25 @@ export default {
       if (!env.DB) return jsonResponse({ error: 'status unavailable: D1 binding missing' }, 503);
       const { results } = await env.DB.prepare('SELECT key, value FROM meta').all<{ key: string; value: string }>();
       const meta = Object.fromEntries(results.map((r) => [r.key, r.value]));
-      return jsonResponse({ version: 3, last_fresh_run: meta.last_fresh_run ?? null, last_backfill_run: meta.last_backfill_run ?? null, last_wr_watch: meta.last_wr_watch ?? null });
+      const counts = await env.DB.batch([
+        env.DB.prepare('SELECT COUNT(*) AS n FROM users'),
+        env.DB.prepare('SELECT COUNT(*) AS n FROM results'),
+        env.DB.prepare('SELECT COUNT(*) AS n FROM wr_history'),
+        env.DB.prepare('SELECT COUNT(*) AS n FROM snapshots'),
+        env.DB.prepare('SELECT COUNT(*) AS n FROM totw_archive'),
+      ]);
+      const n = (i: number) => (counts[i].results[0] as { n: number }).n;
+      return jsonResponse({
+        version: 3,
+        users: n(0),
+        results: n(1),
+        wr_history: n(2),
+        snapshots: n(3),
+        totw_archive: n(4),
+        last_fresh_run: meta.last_fresh_run ?? null,
+        last_backfill_run: meta.last_backfill_run ?? null,
+        last_wr_watch: meta.last_wr_watch ?? null,
+      });
     }
 
     if (requestUrl.pathname === '/users') {
