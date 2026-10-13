@@ -213,7 +213,7 @@ let schemaReady = false;
 async function ensureSchema(db: D1Database): Promise<void> {
   if (schemaReady) return;
   // D1 batches reject some DDL; run each statement individually (all idempotent).
-  const ddl = [
+  const ddl: D1PreparedStatement[] = [
     `CREATE TABLE IF NOT EXISTS catalog (
         user_id TEXT PRIMARY KEY,
         nickname TEXT,
