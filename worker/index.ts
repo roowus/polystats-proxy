@@ -76,7 +76,8 @@ async function wrWatch(db: D1Database): Promise<void> {
         await db
           .prepare(
             `INSERT INTO wr_history (track_id, player, time_ms, set_at, recording)
-             VALUES (?1, ?2, ?3, datetime('now'), NULL)`
+             VALUES (?1, ?2, ?3, datetime('now'), NULL)
+             ON CONFLICT(track_id, player, time_ms, set_at) DO NOTHING`
           )
           .bind(trackId, top.nickname ?? 'unknown', top.frames)
           .run();
@@ -640,8 +641,9 @@ async function snapshotLeaderboards(db: D1Database): Promise<void> {
           db
             .prepare(
               `INSERT INTO wr_history (track_id, player, time_ms, set_at, recording)
-               VALUES (?1, ?2, ?3, datetime('now'), NULL)`
-            ) ON CONFLICT(track_id, player, time_ms, set_at) DO NOTHING
+               VALUES (?1, ?2, ?3, datetime('now'), NULL)
+               ON CONFLICT(track_id, player, time_ms, set_at) DO NOTHING`
+            )
             .bind(trackId, top.nickname ?? 'unknown', top.frames)
         );
       }
