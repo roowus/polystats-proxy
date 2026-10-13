@@ -387,6 +387,10 @@ async function ensureSchema(db: D1Database): Promise<void> {
       // duplicate column — already applied
     }
   }
+  // Backfill lowercase values for rows migrated before the column existed.
+  await db.prepare("UPDATE users SET nickname_lower = lower(nickname) WHERE nickname_lower IS NULL AND nickname IS NOT NULL").run();
+  await db.prepare("UPDATE user_names SET nickname_lower = lower(nickname) WHERE nickname_lower IS NULL AND nickname IS NOT NULL").run();
+
   // Indexes on migrated columns go AFTER the columns exist.
   try {
     await db.prepare('CREATE INDEX IF NOT EXISTS idx_user_names_nicklower ON user_names(nickname_lower)').run();
