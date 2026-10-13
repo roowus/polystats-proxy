@@ -78,18 +78,29 @@ async function wrWatch(db: D1Database): Promise<void> {
         { headers: { Origin: GAME_ORIGIN } }
       );
       if (!res.ok) continue;
-      const data = (await res.json()) as { entries?: { userId: string; nickname?: string; frames?: number }[] };
+      const data = (await res.json()) as { entries?: { id?: number; userId: string; nickname?: string; frames?: number }[] };
       const top = data.entries?.[0];
       if (!top?.frames) continue;
       const best = await db.prepare('SELECT MIN(time_ms) AS t FROM wr_history WHERE track_id = ?1').bind(trackId).first<{ t: number | null }>();
       if (best?.t == null || top.frames < best.t) {
+        let recording: string | null = null;
+        try {
+          if (top.id) {
+            const recs = await fetchRecordings([top.id]);
+            recording = recs.get(top.id) ?? null;
+          }
+        } catch {
+          // recording capture is best-effort
+        }
         await db
           .prepare(
-            `INSERT INTO wr_history (track_id, player, time_ms, set_at, recording)
-             VALUES (?1, ?2, ?3, datetime('now'), NULL)
-             ON CONFLICT(track_id, player, time_ms, set_at) DO NOTHING`
+            `INSERT INTO wr_history (track_id, player, time_ms, set_at, recording, entry_id)
+             VALUES (?1, ?2, ?3, datetime('now'), ?4, ?5)
+             ON CONFLICT(track_id, player, time_ms, set_at) DO UPDATE SET
+               recording = COALESCE(?4, recording),
+               entry_id = COALESCE(?5, entry_id)`
           )
-          .bind(trackId, top.nickname ?? 'unknown', top.frames)
+          .bind(trackId, top.nickname ?? 'unknown', top.frames, recording, top.id ?? null)
           .run();
         broken += 1;
       }
@@ -153,7 +164,7 @@ async function backfillTick(db: D1Database): Promise<{ trackName: string; page: 
   );
   if (!res.ok) throw new Error(`leaderboard fetch failed: ${res.status}`);
   const data = (await res.json()) as {
-    entries?: { userId: string; nickname?: string; carStyle?: string; frames?: number; verifiedState?: number }[];
+    entries?: { id?: number; userId: string; nickname?: string; carStyle?: string; frames?: number; verifiedState?: number }[];
   };
   const entries = data.entries ?? [];
   const upsertUser = db.prepare(
@@ -162,14 +173,15 @@ async function backfillTick(db: D1Database): Promise<{ trackName: string; page: 
      ON CONFLICT(user_id) DO UPDATE SET last_seen = datetime('now')`
   );
   const upsertResult = db.prepare(
-    `INSERT INTO results (track_id, user_id, time_ms, verified)
-     VALUES (?1, ?2, ?3, ?4)
+    `INSERT INTO results (track_id, user_id, time_ms, verified, entry_id)
+     VALUES (?1, ?2, ?3, ?4, ?5)
      ON CONFLICT(track_id, user_id) DO UPDATE SET
        time_ms = MIN(time_ms, excluded.time_ms),
        verified = MAX(verified, excluded.verified),
+       entry_id = COALESCE(excluded.entry_id, entry_id),
        updated_at = datetime('now')`
   );
-  const stmts = entries.map((e) => upsertResult.bind(trackId, e.userId, e.frames ?? 0, e.verifiedState === 1 ? 1 : 0));
+  const stmts = entries.map((e) => upsertResult.bind(trackId, e.userId, e.frames ?? 0, e.verifiedState === 1 ? 1 : 0, e.id ?? null));
   const uniq = new Map(entries.map((e) => [e.userId, e]));
   for (const e of uniq.values()) {
     stmts.push(upsertUser.bind(e.userId, e.nickname ?? null, e.carStyle ?? null));
@@ -217,6 +229,28 @@ async function handleRun(request: Request, url: URL, env: Env): Promise<Response
     .bind(key, new Date().toISOString())
     .run();
   return jsonResponse({ ok: true, job });
+}
+
+interface RecordingEntry {
+  recording: string | null;
+  verifiedState?: number;
+}
+
+/** Fetch up to N recordings from PolyTrack in one request. */
+async function fetchRecordings(ids: number[]): Promise<Map<number, string>> {
+  const out = new Map<number, string>();
+  if (ids.length === 0) return out;
+  const res = await fetch(
+    `https://vps.kodub.com/v6/recordings?version=${API_VERSION}&ids=${ids.join(',')}`,
+    { headers: { Origin: GAME_ORIGIN } }
+  );
+  if (!res.ok) return out;
+  const data = (await res.json()) as (RecordingEntry | null)[];
+  ids.forEach((id, i) => {
+    const item = data[i];
+    if (item?.recording) out.set(id, item.recording);
+  });
+  return out;
 }
 
 /** Upsert a user, capturing nickname/color history on change. */
@@ -533,11 +567,12 @@ async function backfillTracks(db: D1Database, cursor: number): Promise<number> {
      ON CONFLICT(user_id) DO UPDATE SET last_seen = datetime('now')`
   );
   const upsertResult = db.prepare(
-    `INSERT INTO results (track_id, user_id, time_ms, verified)
-     VALUES (?1, ?2, ?3, ?4)
+    `INSERT INTO results (track_id, user_id, time_ms, verified, entry_id)
+     VALUES (?1, ?2, ?3, ?4, ?5)
      ON CONFLICT(track_id, user_id) DO UPDATE SET
        time_ms = MIN(time_ms, excluded.time_ms),
        verified = MAX(verified, excluded.verified),
+       entry_id = COALESCE(excluded.entry_id, entry_id),
        updated_at = datetime('now')`
   );
 
@@ -551,13 +586,13 @@ async function backfillTracks(db: D1Database, cursor: number): Promise<number> {
         );
         if (!res.ok) break;
         const data = (await res.json()) as {
-          entries?: { userId: string; nickname?: string; carStyle?: string; frames?: number; verifiedState?: number }[];
+          entries?: { id?: number; userId: string; nickname?: string; carStyle?: string; frames?: number; verifiedState?: number }[];
         };
         const entries = data.entries ?? [];
         if (entries.length === 0) break; // ran past the end of this board
         const stmts = entries.map((e) => {
           seen += 1;
-          return upsertResult.bind(trackId, e.userId, e.frames ?? 0, e.verifiedState === 1 ? 1 : 0);
+          return upsertResult.bind(trackId, e.userId, e.frames ?? 0, e.verifiedState === 1 ? 1 : 0, e.id ?? null);
         });
         // one user row per entry, deduped in-memory per page
         const uniq = new Map(entries.map((e) => [e.userId, e]));
@@ -572,6 +607,26 @@ async function backfillTracks(db: D1Database, cursor: number): Promise<number> {
     }
   }
   await setCursor(db, (cursor + BACKFILL_TRACKS_PER_RUN) % tracks.length);
+
+  // Recording catch-up: fill missing WR recordings (bounded to 10 per run).
+  try {
+    const missing = await db
+      .prepare('SELECT rowid, track_id, entry_id FROM wr_history WHERE recording IS NULL AND entry_id IS NOT NULL LIMIT 10')
+      .all<{ rowid: number; track_id: string; entry_id: number }>();
+    if (missing.results.length > 0) {
+      const ids = missing.results.map((r) => r.entry_id);
+      const recs = await fetchRecordings(ids);
+      for (const row of missing.results) {
+        const rec = recs.get(row.entry_id);
+        if (rec) {
+          await db.prepare('UPDATE wr_history SET recording = ?1 WHERE rowid = ?2').bind(rec, row.rowid).run();
+        }
+      }
+    }
+  } catch (e) {
+    console.error('recording catch-up failed:', e);
+  }
+
   return seen;
 }
 
@@ -608,7 +663,7 @@ async function snapshotLeaderboards(db: D1Database): Promise<void> {
         );
         if (totwBoard.ok) {
           const board = (await totwBoard.json()) as {
-            entries?: { userId: string; nickname?: string; carStyle?: string; frames?: number; verifiedState?: number }[];
+            entries?: { id?: number; userId: string; nickname?: string; carStyle?: string; frames?: number; verifiedState?: number }[];
           };
           const snapDate = new Date().toISOString().slice(0, 10);
           const stmts: D1PreparedStatement[] = [];
@@ -641,13 +696,21 @@ async function snapshotLeaderboards(db: D1Database): Promise<void> {
       );
       if (!res.ok) continue;
       const data = (await res.json()) as {
-        entries?: { userId: string; nickname?: string; carStyle?: string; frames?: number; verifiedState?: number }[];
+        entries?: { id?: number; userId: string; nickname?: string; carStyle?: string; frames?: number; verifiedState?: number }[];
       };
       const entries = data.entries ?? [];
       if (entries.length === 0) continue;
 
       const statements: D1PreparedStatement[] = [];
       const snapDate = new Date().toISOString().slice(0, 10);
+      // best recordings for the top 10 (bounded storage, replaced on improvement)
+      let topRecordings = new Map<number, string>();
+      try {
+        const top10 = entries.slice(0, 10).map((e) => e.id).filter((x): x is number => typeof x === 'number');
+        topRecordings = await fetchRecordings(top10);
+      } catch {
+        // best-effort
+      }
       entries.forEach((e, i) => {
         statements.push(...userUpsertStatements(db, e.userId, e.nickname ?? null, e.carStyle ?? null, null));
         statements.push(
@@ -660,6 +723,22 @@ async function snapshotLeaderboards(db: D1Database): Promise<void> {
             )
             .bind(trackId, snapDate, i + 1, e.userId, e.frames ?? 0, e.verifiedState === 1 ? 1 : 0)
         );
+        const rec = typeof e.id === 'number' ? topRecordings.get(e.id) : undefined;
+        if (rec && typeof e.userId === 'string') {
+          statements.push(
+            db
+              .prepare(
+                `INSERT INTO results (track_id, user_id, time_ms, verified, entry_id, recording, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
+                 ON CONFLICT(track_id, user_id) DO UPDATE SET
+                   time_ms = MIN(time_ms, excluded.time_ms),
+                   recording = excluded.recording,
+                   entry_id = excluded.entry_id,
+                   updated_at = datetime('now')`
+              )
+              .bind(trackId, e.userId, e.frames ?? 0, e.verifiedState === 1 ? 1 : 0, e.id, rec)
+          );
+        }
       });
 
       // WR history: record the top verified time when it beats the stored best
@@ -833,6 +912,16 @@ export default {
       const aliasUrl = new URL(requestUrl.toString());
       aliasUrl.searchParams.set('job', runAlias[1]);
       return handleRun(request, aliasUrl, env);
+    }
+
+    if (requestUrl.pathname === '/recordings') {
+      if (request.method !== 'GET') return jsonResponse({ error: 'method not allowed' }, 405);
+      const entryId = Number(requestUrl.searchParams.get('entryId'));
+      if (!Number.isSafeInteger(entryId) || entryId <= 0) {
+        return jsonResponse({ error: 'entryId must be a positive integer' }, 400);
+      }
+      const recs = await fetchRecordings([entryId]);
+      return jsonResponse({ entryId, recording: recs.get(entryId) ?? null });
     }
 
     if (requestUrl.pathname === '/run') {
