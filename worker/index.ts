@@ -264,23 +264,24 @@ function userUpsertStatements(
   return [
     db
       .prepare(
-        `INSERT INTO users (user_id, nickname, car_style, country_code, last_seen)
-         VALUES (?1, ?2, ?3, ?4, datetime('now'))
+        `INSERT INTO users (user_id, nickname, nickname_lower, car_style, country_code, last_seen)
+         VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
          ON CONFLICT(user_id) DO UPDATE SET
            nickname = COALESCE(?2, nickname),
-           car_style = COALESCE(?3, car_style),
-           country_code = COALESCE(?4, country_code),
+           nickname_lower = COALESCE(?3, nickname_lower),
+           car_style = COALESCE(?4, car_style),
+           country_code = COALESCE(?5, country_code),
            last_seen = datetime('now')`
       )
-      .bind(userId, nickname, carStyle, countryCode ?? null),
+      .bind(userId, nickname, nickname?.toLowerCase() ?? null, carStyle, countryCode ?? null),
     // name/color history: a row is only written when a NEW value appears
     // (OR IGNORE), so unchanged players cost 1 write instead of 5.
     db
       .prepare(
-        `INSERT OR IGNORE INTO user_names (user_id, nickname, last_seen)
-         VALUES (?1, ?2, datetime('now'))`
+        `INSERT OR IGNORE INTO user_names (user_id, nickname, nickname_lower, last_seen)
+         VALUES (?1, ?2, ?3, datetime('now'))`
       )
-      .bind(userId, nickname),
+      .bind(userId, nickname, nickname?.toLowerCase() ?? null),
     db
       .prepare(
         `INSERT OR IGNORE INTO user_styles (user_id, car_style, last_seen)
@@ -364,6 +365,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
       first_seen TEXT NOT NULL DEFAULT (datetime('now'))
     )`),
     db.prepare('CREATE INDEX IF NOT EXISTS idx_users_nickname ON users(nickname)'),
+    db.prepare('CREATE INDEX IF NOT EXISTS idx_users_nicklower ON users(nickname_lower)'),
     db.prepare('CREATE INDEX IF NOT EXISTS idx_snapshots_user ON snapshots(user_id)'),
   ];
   for (let i = 0; i < ddl.length; i++) {
@@ -374,6 +376,22 @@ async function ensureSchema(db: D1Database): Promise<void> {
       if (/already exists/i.test(msg)) continue;
       throw new Error(`ensureSchema statement ${i} failed: ${msg}`);
     }
+  }
+  // Column-level migrations for tables created before a schema extension.
+  for (const stmt of [
+    'ALTER TABLE users ADD COLUMN nickname_lower TEXT',
+    'ALTER TABLE user_names ADD COLUMN nickname_lower TEXT',
+  ]) {
+    try {
+      await db.prepare(stmt).run();
+    } catch {
+      // duplicate column — already applied
+    }
+  }
+  try {
+    await db.prepare('CREATE INDEX IF NOT EXISTS idx_user_names_nicklower ON user_names(nickname_lower)').run();
+  } catch {
+    // index already exists
   }
   // One-time fold: legacy catalog rows -> users.save_count, then drop the old table.
   const folded = await db.prepare("SELECT value FROM meta WHERE key = 'catalog_folded'").first<{ value: string }>();
@@ -965,8 +983,8 @@ export default {
       const search = requestUrl.searchParams.get('q');
       const { results } = search
         ? await env.DB
-            .prepare("SELECT user_id, nickname, car_style, last_seen FROM users WHERE nickname LIKE ?1 ORDER BY last_seen DESC LIMIT ?2")
-            .bind(`%${search}%`, limit)
+            .prepare("SELECT user_id, nickname, car_style, last_seen FROM users WHERE nickname_lower LIKE ?1 ORDER BY last_seen DESC LIMIT ?2")
+            .bind(`%${search.toLowerCase()}%`, limit)
             .all()
         : await env.DB
             .prepare('SELECT user_id, nickname, car_style, last_seen FROM users ORDER BY last_seen DESC LIMIT ?1')
