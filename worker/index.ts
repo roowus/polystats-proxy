@@ -639,9 +639,9 @@ async function snapshotLeaderboards(db: D1Database): Promise<void> {
         statements.push(
           db
             .prepare(
-              `INSERT OR IGNORE INTO wr_history (track_id, player, time_ms, set_at, recording)
+              `INSERT INTO wr_history (track_id, player, time_ms, set_at, recording)
                VALUES (?1, ?2, ?3, datetime('now'), NULL)`
-            )
+            ) ON CONFLICT(track_id, player, time_ms, set_at) DO NOTHING
             .bind(trackId, top.nickname ?? 'unknown', top.frames)
         );
       }
