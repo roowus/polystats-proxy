@@ -1,0 +1,37 @@
+# Redundant scheduler: the worker's own cron triggers are primary; this is a
+# second clock so data keeps flowing even if a Cloudflare cron misfires.
+# Jobs are idempotent and min-interval guarded inside the worker.
+name: Scheduler
+
+on:
+  schedule:
+    - cron: "*/15 * * * *" # WR watch (worker skips if it ran recently)
+    - cron: "0 */6 * * *"  # full snapshot
+    - cron: "0 6 * * *"    # daily backfill
+  workflow_dispatch:        # manual trigger
+    inputs:
+      job:
+        description: "Job to run"
+        required: true
+        default: "watch"
+        type: choice
+        options: [watch, snapshot, backfill]
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule }}
+    steps:
+      - name: Trigger worker job
+        run: |
+          JOB="${{ github.event.inputs.job || watchdog }}"
+          # map this workflow's schedule to a job name
+          if [ -z "${{ github.event.inputs.job }}" ]; then
+            case "${{ github.event.schedule }}" in
+              "*/15 * * * *") JOB="watch" ;;
+              "0 */6 * * *") JOB="snapshot" ;;
+              "0 6 * * *") JOB="backfill" ;;
+            esac
+          fi
+          curl -sf --max-time 300 "${{ secrets.WORKER_URL }}/run?job=$JOB${{ secrets.SCHEDULE_TOKEN && format('&token={0}', secrets.SCHEDULE_TOKEN) || '' }}" \
+            -H "X-Schedule-Token: ${{ secrets.SCHEDULE_TOKEN }}"
