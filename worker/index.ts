@@ -55,11 +55,30 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+/** Create the catalog table on first use (zero-touch migrations). */
+let schemaReady = false;
+async function ensureSchema(env: Env): Promise<void> {
+  if (schemaReady) return;
+  await env.DB
+    .prepare(
+      `CREATE TABLE IF NOT EXISTS catalog (
+        user_id TEXT PRIMARY KEY,
+        nickname TEXT,
+        saved_count INTEGER NOT NULL DEFAULT 1,
+        last_seen TEXT NOT NULL
+      )`
+    )
+    .run();
+  schemaReady = true;
+}
+
 /** Player catalog endpoints (backed by D1; 503 when the binding is absent). */
 async function handleCatalog(request: Request, url: URL, env: Env): Promise<Response> {
   if (!env.DB) {
     return jsonResponse({ error: 'catalog unavailable: D1 binding missing' }, 503);
   }
+
+  await ensureSchema(env);
 
   if (request.method === 'GET') {
     const limit = Math.min(Number(url.searchParams.get('limit') ?? 50) || 50, 100);
