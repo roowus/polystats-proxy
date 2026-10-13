@@ -803,7 +803,7 @@ export default {
       if (!env.DB) return jsonResponse({ error: 'status unavailable: D1 binding missing' }, 503);
       const { results } = await env.DB.prepare('SELECT key, value FROM meta').all<{ key: string; value: string }>();
       const meta = Object.fromEntries(results.map((r) => [r.key, r.value]));
-      return jsonResponse({ last_fresh_run: meta.last_fresh_run ?? null, last_backfill_run: meta.last_backfill_run ?? null });
+      return jsonResponse({ version: 3, last_fresh_run: meta.last_fresh_run ?? null, last_backfill_run: meta.last_backfill_run ?? null, last_wr_watch: meta.last_wr_watch ?? null });
     }
 
     if (requestUrl.pathname === '/users') {
