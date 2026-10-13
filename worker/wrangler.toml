@@ -5,3 +5,12 @@ compatibility_date = "2024-12-01"
 # Deployed via Cloudflare Workers Builds (Git integration) or `npx wrangler deploy`.
 # The app expects this worker to be reachable at:
 #   https://polystats-proxy.<your-subdomain>.workers.dev/?url=<encoded api url>
+
+# Player catalog database. Create it once, then deploy:
+#   npx wrangler d1 create polystats-catalog
+#   npx wrangler d1 execute polystats-catalog --remote --file schema.sql
+# and paste the database_id below (keep the binding name "DB"):
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "polystats-catalog"
+# database_id = "<paste-id>"
