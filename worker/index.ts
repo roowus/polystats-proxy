@@ -214,72 +214,75 @@ async function ensureSchema(db: D1Database): Promise<void> {
   if (schemaReady) return;
   // D1 batches reject some DDL; run each statement individually (all idempotent).
   const ddl: D1PreparedStatement[] = [
-    `CREATE TABLE IF NOT EXISTS catalog (
-        user_id TEXT PRIMARY KEY,
-        nickname TEXT,
-        saved_count INTEGER NOT NULL DEFAULT 1,
-        last_seen TEXT NOT NULL
-      )`,
-    `CREATE TABLE IF NOT EXISTS wr_history (
-        track_id TEXT NOT NULL,
-        player TEXT NOT NULL,
-        time_ms INTEGER NOT NULL,
-        set_at TEXT NOT NULL,
-        recording TEXT,
-        UNIQUE(track_id, player, time_ms, set_at)
-      )`,
-    `CREATE TABLE IF NOT EXISTS users (
-        user_id TEXT PRIMARY KEY,
-        nickname TEXT,
-        car_style TEXT,
-        first_seen TEXT NOT NULL DEFAULT (datetime('now')),
-        last_seen TEXT NOT NULL DEFAULT (datetime('now'))
-      )`,
-    `CREATE TABLE IF NOT EXISTS results (
-        track_id TEXT NOT NULL,
-        user_id TEXT NOT NULL,
-        time_ms INTEGER NOT NULL,
-        verified INTEGER NOT NULL DEFAULT 0,
-        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-        PRIMARY KEY (track_id, user_id)
-      )`,
-    `CREATE TABLE IF NOT EXISTS meta (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      )`,
-    `CREATE TABLE IF NOT EXISTS user_names (
-        user_id TEXT NOT NULL,
-        nickname TEXT NOT NULL,
-        first_seen TEXT NOT NULL DEFAULT (datetime('now')),
-        last_seen TEXT NOT NULL DEFAULT (datetime('now')),
-        PRIMARY KEY (user_id, nickname)
-      )`,
-    `CREATE TABLE IF NOT EXISTS user_styles (
-        user_id TEXT NOT NULL,
-        car_style TEXT NOT NULL,
-        first_seen TEXT NOT NULL DEFAULT (datetime('now')),
-        last_seen TEXT NOT NULL DEFAULT (datetime('now')),
-        PRIMARY KEY (user_id, car_style)
-      )`,
-    `CREATE TABLE IF NOT EXISTS snapshots (
-        track_id TEXT NOT NULL,
-        snap_date TEXT NOT NULL,
-        position INTEGER NOT NULL,
-        user_id TEXT NOT NULL,
-        time_ms INTEGER NOT NULL,
-        verified INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY (track_id, snap_date, position)
-      )`,
-    `CREATE TABLE IF NOT EXISTS totw_archive (
-        track_id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        author TEXT,
-        environment INTEGER,
-        end_time TEXT,
-        first_seen TEXT NOT NULL DEFAULT (datetime('now'))
-      )`,
-    db.prepare('ALTER TABLE users ADD COLUMN country_code TEXT'),
-    db.prepare('ALTER TABLE users ADD COLUMN save_count INTEGER NOT NULL DEFAULT 0'),
+    db.prepare(`CREATE TABLE IF NOT EXISTS catalog (
+      user_id TEXT PRIMARY KEY,
+      nickname TEXT,
+      saved_count INTEGER NOT NULL DEFAULT 1,
+      last_seen TEXT NOT NULL
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS wr_history (
+      track_id TEXT NOT NULL,
+      player TEXT NOT NULL,
+      time_ms INTEGER NOT NULL,
+      set_at TEXT NOT NULL,
+      recording TEXT,
+      UNIQUE(track_id, player, time_ms, set_at)
+    )`),
+    db.prepare('CREATE INDEX IF NOT EXISTS idx_history_track ON wr_history(track_id, time_ms)'),
+    db.prepare(`CREATE TABLE IF NOT EXISTS users (
+      user_id TEXT PRIMARY KEY,
+      nickname TEXT,
+      car_style TEXT,
+      country_code TEXT,
+      save_count INTEGER NOT NULL DEFAULT 0,
+      first_seen TEXT NOT NULL DEFAULT (datetime('now')),
+      last_seen TEXT NOT NULL DEFAULT (datetime('now'))
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS results (
+      track_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      time_ms INTEGER NOT NULL,
+      verified INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (track_id, user_id)
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS meta (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS user_names (
+      user_id TEXT NOT NULL,
+      nickname TEXT NOT NULL,
+      first_seen TEXT NOT NULL DEFAULT (datetime('now')),
+      last_seen TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (user_id, nickname)
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS user_styles (
+      user_id TEXT NOT NULL,
+      car_style TEXT NOT NULL,
+      first_seen TEXT NOT NULL DEFAULT (datetime('now')),
+      last_seen TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (user_id, car_style)
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS snapshots (
+      track_id TEXT NOT NULL,
+      snap_date TEXT NOT NULL,
+      position INTEGER NOT NULL,
+      user_id TEXT NOT NULL,
+      time_ms INTEGER NOT NULL,
+      verified INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (track_id, snap_date, position)
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS totw_archive (
+      track_id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      author TEXT,
+      environment INTEGER,
+      end_time TEXT,
+      first_seen TEXT NOT NULL DEFAULT (datetime('now'))
+    )`),
+    db.prepare('CREATE INDEX IF NOT EXISTS idx_users_nickname ON users(nickname)'),
+    db.prepare('CREATE INDEX IF NOT EXISTS idx_snapshots_user ON snapshots(user_id)'),
   ];
   for (const stmt of ddl) {
     try {
