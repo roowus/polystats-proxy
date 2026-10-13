@@ -116,6 +116,50 @@ async function runBackfill(db: D1Database): Promise<void> {
 }
 
 /**
+ * Backfill tick: exactly one leaderboard page (50 players) per call,
+ * cycling through tracks and depth. Designed for a 5-minute external ping:
+ * 50 players x 288 ticks/day = ~14.4k players/day of steady coverage.
+ */
+async function backfillTick(db: D1Database): Promise<{ trackName: string; page: number; players: number }> {
+  await ensureSchema(db);
+  const cursor = await getCursor(db);
+  const trackIdx = cursor % ALL_TRACK_IDS.length;
+  const page = Math.floor(cursor / ALL_TRACK_IDS.length) % BACKFILL_PAGES;
+  const [trackName, trackId] = ALL_TRACK_IDS[trackIdx];
+
+  const res = await fetch(
+    `https://vps.kodub.com/v6/leaderboard?version=${API_VERSION}&trackId=${trackId}&skip=${page * SNAPSHOT_DEPTH}&amount=${SNAPSHOT_DEPTH}&onlyVerified=false`,
+    { headers: { Origin: GAME_ORIGIN } }
+  );
+  if (!res.ok) throw new Error(`leaderboard fetch failed: ${res.status}`);
+  const data = (await res.json()) as {
+    entries?: { userId: string; nickname?: string; carStyle?: string; frames?: number; verifiedState?: number }[];
+  };
+  const entries = data.entries ?? [];
+  const upsertUser = db.prepare(
+    `INSERT INTO users (user_id, nickname, car_style, last_seen)
+     VALUES (?1, ?2, ?3, datetime('now'))
+     ON CONFLICT(user_id) DO UPDATE SET last_seen = datetime('now')`
+  );
+  const upsertResult = db.prepare(
+    `INSERT INTO results (track_id, user_id, time_ms, verified)
+     VALUES (?1, ?2, ?3, ?4)
+     ON CONFLICT(track_id, user_id) DO UPDATE SET
+       time_ms = MIN(time_ms, excluded.time_ms),
+       verified = MAX(verified, excluded.verified),
+       updated_at = datetime('now')`
+  );
+  const stmts = entries.map((e) => upsertResult.bind(trackId, e.userId, e.frames ?? 0, e.verifiedState === 1 ? 1 : 0));
+  const uniq = new Map(entries.map((e) => [e.userId, e]));
+  for (const e of uniq.values()) {
+    stmts.push(upsertUser.bind(e.userId, e.nickname ?? null, e.carStyle ?? null));
+  }
+  if (stmts.length > 0) await db.batch(stmts);
+  await setCursor(db, cursor + 1);
+  return { trackName, page, players: entries.length };
+}
+
+/**
  * HTTP-triggered jobs for external schedulers (GitHub Actions, cron-job.org…).
  * Guarded by SCHEDULE_TOKEN and a minimum-interval so double-fires and
  * strangers can't burn the D1 write budget.
@@ -124,8 +168,8 @@ async function handleRun(request: Request, url: URL, env: Env): Promise<Response
   if (!env.DB) return jsonResponse({ error: 'jobs unavailable: D1 binding missing' }, 503);
   const db = env.DB;
   const job = url.searchParams.get('job');
-  if (job !== 'watch' && job !== 'snapshot' && job !== 'backfill') {
-    return jsonResponse({ error: "job must be 'watch' | 'snapshot' | 'backfill'" }, 400);
+  if (job !== 'watch' && job !== 'snapshot' && job !== 'backfill' && job !== 'tick') {
+    return jsonResponse({ error: "job must be 'watch' | 'snapshot' | 'backfill' | 'tick'" }, 400);
   }
   if (env.SCHEDULE_TOKEN) {
     const token = url.searchParams.get('token') ?? request.headers.get('X-Schedule-Token');
@@ -134,7 +178,7 @@ async function handleRun(request: Request, url: URL, env: Env): Promise<Response
     }
   }
   // Min-interval guard: skip if this job ran recently (idempotent + abuse-proof).
-  const intervals: Record<string, number> = { watch: 10 * 60 * 1000, snapshot: 5 * 3600 * 1000, backfill: 7 * 3600 * 1000 };
+  const intervals: Record<string, number> = { watch: 10 * 60 * 1000, snapshot: 5 * 3600 * 1000, backfill: 7 * 3600 * 1000, tick: 4 * 60 * 1000 };
   const key = `last_run_${job}`;
   const last = await db.prepare('SELECT value FROM meta WHERE key = ?1').bind(key).first<{ value: string }>();
   if (last?.value && Date.now() - new Date(last.value).getTime() < intervals[job]) {
@@ -737,7 +781,7 @@ export default {
         await ensureSchema(db);
         if (controller.cron === '*/15 * * * *') {
           await wrWatch(db);
-        } else if (controller.cron === '0 6 * * *' || controller.cron === '0 12 * * *' || controller.cron === '0 18 * * *') {
+        } else if (controller.cron === '0 12 * * *' || controller.cron === '0 18 * * *') {
           await runBackfill(db);
         } else {
           await runSnapshot(db);
