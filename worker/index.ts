@@ -500,13 +500,15 @@ async function ensureSchema(db: D1Database): Promise<void> {
   // row-read allowance. FTS5 gives an inverted index instead, so a search
   // touches only matching rows.
   //
-  // Tracked in `meta` and wrapped in try/catch: if FTS5 is unavailable the
-  // worker keeps serving on the LIKE path instead of failing to start.
-  const ftsReady = await db
-    .prepare("SELECT value FROM meta WHERE key = 'fts_ready'")
-    .first<{ value: string }>();
-  if (!ftsReady) {
-    try {
+  // Tracked in `meta` and fully wrapped in try/catch. Everything here — the
+  // readiness probe included — must be non-fatal: ensureSchema gates nearly
+  // every route, so an unhandled error here takes the whole worker down rather
+  // than just disabling search.
+  try {
+    const ftsReady = await db
+      .prepare("SELECT value FROM meta WHERE key = 'fts_ready'")
+      .first<{ value: string }>();
+    if (!ftsReady) {
       await db
         .prepare(
           `CREATE VIRTUAL TABLE IF NOT EXISTS users_fts USING fts5(
@@ -526,10 +528,10 @@ async function ensureSchema(db: D1Database): Promise<void> {
       await db
         .prepare("INSERT INTO meta (key, value) VALUES ('fts_ready', '1') ON CONFLICT(key) DO UPDATE SET value = '1'")
         .run();
-    } catch (err) {
-      // Leave fts_ready unset so the next boot retries; search falls back to LIKE.
-      console.error('FTS index unavailable, falling back to LIKE:', String(err));
     }
+  } catch (err) {
+    // Leave fts_ready unset so the next boot retries; search falls back to LIKE.
+    console.error('FTS index unavailable, falling back to LIKE:', String(err));
   }
 
   schemaReady = true;
