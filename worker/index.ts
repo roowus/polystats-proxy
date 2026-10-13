@@ -134,7 +134,7 @@ async function handleRun(request: Request, url: URL, env: Env): Promise<Response
     }
   }
   // Min-interval guard: skip if this job ran recently (idempotent + abuse-proof).
-  const intervals: Record<string, number> = { watch: 10 * 60 * 1000, snapshot: 5 * 3600 * 1000, backfill: 20 * 3600 * 1000 };
+  const intervals: Record<string, number> = { watch: 10 * 60 * 1000, snapshot: 5 * 3600 * 1000, backfill: 7 * 3600 * 1000 };
   const key = `last_run_${job}`;
   const last = await db.prepare('SELECT value FROM meta WHERE key = ?1').bind(key).first<{ value: string }>();
   if (last?.value && Date.now() - new Date(last.value).getTime() < intervals[job]) {

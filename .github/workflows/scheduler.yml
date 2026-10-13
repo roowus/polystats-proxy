@@ -6,8 +6,9 @@ name: Scheduler
 on:
   schedule:
     - cron: "*/15 * * * *" # WR watch (worker skips if it ran recently)
-    - cron: "0 */6 * * *"  # full snapshot
-    - cron: "0 6 * * *"    # daily backfill
+    - cron: "0 */6 * * *"  # full snapshot (redundancy — CF primary)
+    - cron: "0 2 * * *"    # backfill #2 (off-peak, no CF collision)
+    - cron: "0 23 * * *"   # backfill #3 (off-peak, no CF collision)
   workflow_dispatch:        # manual trigger
     inputs:
       job:
@@ -30,7 +31,7 @@ jobs:
             case "${{ github.event.schedule }}" in
               "*/15 * * * *") JOB="watch" ;;
               "0 */6 * * *") JOB="snapshot" ;;
-              "0 6 * * *") JOB="backfill" ;;
+              *) JOB="backfill" ;;
             esac
           fi
           curl -sf --max-time 300 "${{ secrets.WORKER_URL }}/run?job=$JOB${{ secrets.SCHEDULE_TOKEN && format('&token={0}', secrets.SCHEDULE_TOKEN) || '' }}" \
