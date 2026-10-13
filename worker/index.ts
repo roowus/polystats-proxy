@@ -288,7 +288,79 @@ function userUpsertStatements(
          VALUES (?1, ?2, datetime('now'))`
       )
       .bind(userId, carStyle),
+    // Keep the search index in step with nicknames. FTS5 rows are keyed by the
+    // indexed text, so delete this player's entries before adding the current
+    // one; otherwise a rename leaves the old name searchable.
+    db.prepare('DELETE FROM users_fts WHERE user_id = ?1').bind(userId),
+    db
+      .prepare('INSERT INTO users_fts (nickname_lower, user_id) SELECT ?1, ?2 WHERE ?1 IS NOT NULL AND ?1 <> ""')
+      .bind(nickname?.toLowerCase() ?? null, userId),
   ];
+}
+
+/**
+ * Build an FTS5 MATCH expression for a user-typed search term.
+ *
+ * FTS5 has its own query syntax, so raw input must not reach MATCH directly:
+ * characters like `"`, `*`, `(`, `-` and the keywords AND/OR/NOT are operators,
+ * and a malformed expression throws rather than returning no rows.
+ *
+ * Each whitespace-separated word becomes a quoted prefix term, so `mons` matches
+ * `Monstrosity` and `mon ster` requires both. Interior quotes are doubled, which
+ * is FTS5's escape for a literal quote inside a string.
+ */
+export function buildFtsQuery(term: string): string {
+  return term
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => `"${word.replace(/"/g, '""')}"*`)
+    .join(' ');
+}
+
+/**
+ * Search players by nickname.
+ *
+ * Prefers the FTS5 index, which reads only matching rows. A prefix query covers
+ * the common case of typing a name from the start; when FTS returns nothing we
+ * fall back to the LIKE scan, so interior fragments (`rosity` -> `Monstrosity`)
+ * keep working. The fallback is the expensive path, so it only runs when the
+ * cheap one found nothing.
+ */
+async function searchUsers(
+  db: D1Database,
+  term: string,
+  limit: number
+): Promise<{ results: Record<string, unknown>[] }> {
+  const lowered = term.toLowerCase();
+  const ftsQuery = buildFtsQuery(term);
+
+  if (ftsQuery) {
+    try {
+      const { results } = await db
+        .prepare(
+          `SELECT u.user_id, u.nickname, u.car_style, u.last_seen
+           FROM users_fts f
+           JOIN users u ON u.user_id = f.user_id
+           WHERE users_fts MATCH ?1
+           ORDER BY u.last_seen DESC
+           LIMIT ?2`
+        )
+        .bind(ftsQuery, limit)
+        .all();
+      if (results && results.length > 0) return { results };
+    } catch (err) {
+      // Malformed MATCH or a missing index — fall through to LIKE.
+      console.error('FTS search failed, using LIKE:', String(err));
+    }
+  }
+
+  return db
+    .prepare(
+      "SELECT user_id, nickname, car_style, last_seen FROM users WHERE nickname_lower LIKE ?1 ORDER BY last_seen DESC LIMIT ?2"
+    )
+    .bind(`%${lowered}%`, limit)
+    .all();
 }
 
 /** Create the catalog table on first use (zero-touch migrations). */
@@ -417,6 +489,47 @@ async function ensureSchema(db: D1Database): Promise<void> {
       .prepare("INSERT INTO meta (key, value) VALUES ('catalog_folded', '1') ON CONFLICT(key) DO UPDATE SET value = '1'")
       .run();
   }
+
+  // Full-text index for player search.
+  //
+  // Search uses `nickname_lower LIKE '%term%'`. A leading wildcard cannot use a
+  // b-tree index, so SQLite reads every row in `users` on each keystroke: cheap
+  // at 10k users, but linear as the catalog grows and it burns the daily
+  // row-read allowance. FTS5 gives an inverted index instead, so a search
+  // touches only matching rows.
+  //
+  // Tracked in `meta` and wrapped in try/catch: if FTS5 is unavailable the
+  // worker keeps serving on the LIKE path instead of failing to start.
+  const ftsReady = await db
+    .prepare("SELECT value FROM meta WHERE key = 'fts_ready'")
+    .first<{ value: string }>();
+  if (!ftsReady) {
+    try {
+      await db
+        .prepare(
+          `CREATE VIRTUAL TABLE IF NOT EXISTS users_fts USING fts5(
+             nickname_lower,
+             user_id UNINDEXED,
+             tokenize = 'unicode61'
+           )`
+        )
+        .run();
+      await db
+        .prepare(
+          `INSERT INTO users_fts (nickname_lower, user_id)
+           SELECT COALESCE(nickname_lower, lower(nickname)), user_id
+           FROM users WHERE nickname IS NOT NULL AND nickname <> ''`
+        )
+        .run();
+      await db
+        .prepare("INSERT INTO meta (key, value) VALUES ('fts_ready', '1') ON CONFLICT(key) DO UPDATE SET value = '1'")
+        .run();
+    } catch (err) {
+      // Leave fts_ready unset so the next boot retries; search falls back to LIKE.
+      console.error('FTS index unavailable, falling back to LIKE:', String(err));
+    }
+  }
+
   schemaReady = true;
 }
 
@@ -1005,10 +1118,7 @@ export default {
       const limit = Math.min(Number(requestUrl.searchParams.get('limit') ?? 50) || 50, 200);
       const search = requestUrl.searchParams.get('q');
       const { results } = search
-        ? await env.DB
-            .prepare("SELECT user_id, nickname, car_style, last_seen FROM users WHERE nickname_lower LIKE ?1 ORDER BY last_seen DESC LIMIT ?2")
-            .bind(`%${search.toLowerCase()}%`, limit)
-            .all()
+        ? await searchUsers(db, search, limit)
         : await env.DB
             .prepare('SELECT user_id, nickname, car_style, last_seen FROM users ORDER BY last_seen DESC LIMIT ?1')
             .bind(limit)
