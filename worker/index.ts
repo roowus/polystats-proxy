@@ -239,34 +239,18 @@ function userUpsertStatements(
            last_seen = datetime('now')`
       )
       .bind(userId, nickname, carStyle, countryCode ?? null),
-    // name history: append when this nickname isn't already recorded
+    // name/color history: a row is only written when a NEW value appears
+    // (OR IGNORE), so unchanged players cost 1 write instead of 5.
     db
       .prepare(
-        `INSERT INTO user_names (user_id, nickname, last_seen)
-         SELECT ?1, ?2, datetime('now')
-         WHERE ?2 IS NOT NULL AND NOT EXISTS (
-           SELECT 1 FROM user_names WHERE user_id = ?1 AND nickname = ?2
-         )`
+        `INSERT OR IGNORE INTO user_names (user_id, nickname, last_seen)
+         VALUES (?1, ?2, datetime('now'))`
       )
       .bind(userId, nickname),
     db
       .prepare(
-        `UPDATE user_names SET last_seen = datetime('now') WHERE user_id = ?1 AND nickname = ?2`
-      )
-      .bind(userId, nickname),
-    // car style history: same pattern
-    db
-      .prepare(
-        `INSERT INTO user_styles (user_id, car_style, last_seen)
-         SELECT ?1, ?2, datetime('now')
-         WHERE ?2 IS NOT NULL AND NOT EXISTS (
-           SELECT 1 FROM user_styles WHERE user_id = ?1 AND car_style = ?2
-         )`
-      )
-      .bind(userId, carStyle),
-    db
-      .prepare(
-        `UPDATE user_styles SET last_seen = datetime('now') WHERE user_id = ?1 AND car_style = ?2`
+        `INSERT OR IGNORE INTO user_styles (user_id, car_style, last_seen)
+         VALUES (?1, ?2, datetime('now'))`
       )
       .bind(userId, carStyle),
   ];
