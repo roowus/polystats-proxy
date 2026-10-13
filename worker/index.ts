@@ -199,6 +199,12 @@ async function ensureSchema(env: Env): Promise<void> {
     env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_users_nickname ON users(nickname)'),
     env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_snapshots_user ON snapshots(user_id)'),
   ]);
+  // Column-level migrations for tables created before a schema extension.
+  try {
+    await env.DB.prepare('ALTER TABLE users ADD COLUMN country_code TEXT').run();
+  } catch {
+    // column already exists
+  }
   schemaReady = true;
 }
 
