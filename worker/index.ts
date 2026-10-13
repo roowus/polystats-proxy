@@ -298,7 +298,10 @@ async function handleCatalog(request: Request, url: URL, env: Env): Promise<Resp
     if (!userId || !/^[a-f0-9]{64}$/.test(userId)) {
       return jsonResponse({ error: 'userId query param must be 64-char hex' }, 400);
     }
-    await env.DB.prepare('DELETE FROM catalog WHERE user_id = ?1').bind(userId).run();
+    await env.DB.batch([
+      env.DB.prepare('DELETE FROM catalog WHERE user_id = ?1').bind(userId),
+      env.DB.prepare('DELETE FROM users WHERE user_id = ?1').bind(userId),
+    ]);
     return jsonResponse({ ok: true });
   }
 
