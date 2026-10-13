@@ -298,7 +298,8 @@ async function ensureSchema(db: D1Database): Promise<void> {
   if (!folded) {
     await db
       .prepare(
-        `INSERT INTO users (user_id, save_count) SELECT user_id, saved_count FROM catalog
+        `INSERT INTO users (user_id, save_count)
+         SELECT user_id, saved_count FROM catalog WHERE true
          ON CONFLICT(user_id) DO UPDATE SET save_count = MAX(users.save_count, excluded.save_count)`
       )
       .run();
