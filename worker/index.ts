@@ -942,7 +942,7 @@ export default {
       ]);
       const n = (i: number) => (counts[i].results[0] as { n: number }).n;
       return jsonResponse({
-        version: 3,
+        version: 4,
         users: n(0),
         results: n(1),
         wr_history: n(2),
