@@ -58,9 +58,8 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 /** WR watch: cheap — only writes when a record actually falls. */
-async function wrWatch(env: Env): Promise<void> {
-  if (!env.DB) return;
-  await ensureSchema(env);
+async function wrWatch(db: D1Database): Promise<void> {
+  await ensureSchema(db);
   let broken = 0;
   for (const [, trackId] of ALL_TRACK_IDS) {
     try {
@@ -72,9 +71,9 @@ async function wrWatch(env: Env): Promise<void> {
       const data = (await res.json()) as { entries?: { userId: string; nickname?: string; frames?: number }[] };
       const top = data.entries?.[0];
       if (!top?.frames) continue;
-      const best = await env.DB.prepare('SELECT MIN(time_ms) AS t FROM wr_history WHERE track_id = ?1').bind(trackId).first<{ t: number | null }>();
+      const best = await db.prepare('SELECT MIN(time_ms) AS t FROM wr_history WHERE track_id = ?1').bind(trackId).first<{ t: number | null }>();
       if (best?.t == null || top.frames < best.t) {
-        await env.DB
+        await db
           .prepare(
             `INSERT OR IGNORE INTO wr_history (track_id, player, time_ms, set_at, recording)
              VALUES (?1, ?2, ?3, datetime('now'), NULL)`
@@ -87,7 +86,7 @@ async function wrWatch(env: Env): Promise<void> {
       console.error('WR watch failed for', trackId, e);
     }
   }
-  await env.DB
+  await db
     .prepare("INSERT INTO meta (key, value) VALUES ('last_wr_watch', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1")
     .bind(new Date().toISOString())
     .run();
@@ -95,22 +94,20 @@ async function wrWatch(env: Env): Promise<void> {
 }
 
 /** Full top-50 snapshot of every track + TOTW archive. */
-async function runSnapshot(env: Env): Promise<void> {
-  if (!env.DB) return;
-  await snapshotLeaderboards(env);
-  await env.DB
+async function runSnapshot(db: D1Database): Promise<void> {
+  await snapshotLeaderboards(db);
+  await db
     .prepare("INSERT INTO meta (key, value) VALUES ('last_fresh_run', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1")
     .bind(new Date().toISOString())
     .run();
 }
 
 /** Daily backfill: deep-crawl the long tail. */
-async function runBackfill(env: Env): Promise<void> {
-  if (!env.DB) return;
-  await ensureSchema(env);
-  const cursor = await getCursor(env);
-  const seen = await backfillTracks(env, cursor);
-  await env.DB
+async function runBackfill(db: D1Database): Promise<void> {
+  await ensureSchema(db);
+  const cursor = await getCursor(db);
+  const seen = await backfillTracks(db, cursor);
+  await db
     .prepare("INSERT INTO meta (key, value) VALUES ('last_backfill_run', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1")
     .bind(new Date().toISOString())
     .run();
@@ -123,6 +120,8 @@ async function runBackfill(env: Env): Promise<void> {
  * strangers can't burn the D1 write budget.
  */
 async function handleRun(request: Request, url: URL, env: Env): Promise<Response> {
+  if (!env.DB) return jsonResponse({ error: 'jobs unavailable: D1 binding missing' }, 503);
+  const db = env.DB;
   const job = url.searchParams.get('job');
   if (job !== 'watch' && job !== 'snapshot' && job !== 'backfill') {
     return jsonResponse({ error: "job must be 'watch' | 'snapshot' | 'backfill'" }, 400);
@@ -136,15 +135,15 @@ async function handleRun(request: Request, url: URL, env: Env): Promise<Response
   // Min-interval guard: skip if this job ran recently (idempotent + abuse-proof).
   const intervals: Record<string, number> = { watch: 10 * 60 * 1000, snapshot: 5 * 3600 * 1000, backfill: 20 * 3600 * 1000 };
   const key = `last_run_${job}`;
-  const last = await env.DB.prepare('SELECT value FROM meta WHERE key = ?1').bind(key).first<{ value: string }>();
+  const last = await db.prepare('SELECT value FROM meta WHERE key = ?1').bind(key).first<{ value: string }>();
   if (last?.value && Date.now() - new Date(last.value).getTime() < intervals[job]) {
     return jsonResponse({ ok: true, skipped: true, reason: 'ran recently', last_run: last.value });
   }
 
-  if (job === 'watch') await wrWatch(env);
-  else if (job === 'snapshot') await runSnapshot(env);
-  else await runBackfill(env);
-  await env.DB
+  if (job === 'watch') await wrWatch(db);
+  else if (job === 'snapshot') await runSnapshot(db);
+  else await runBackfill(db);
+  await db
     .prepare("INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2")
     .bind(key, new Date().toISOString())
     .run();
@@ -206,10 +205,10 @@ function userUpsertStatements(
 
 /** Create the catalog table on first use (zero-touch migrations). */
 let schemaReady = false;
-async function ensureSchema(env: Env): Promise<void> {
+async function ensureSchema(db: D1Database): Promise<void> {
   if (schemaReady) return;
-  await env.DB.batch([
-    env.DB.prepare(
+  await db.batch([
+    db.prepare(
       `CREATE TABLE IF NOT EXISTS catalog (
         user_id TEXT PRIMARY KEY,
         nickname TEXT,
@@ -217,7 +216,7 @@ async function ensureSchema(env: Env): Promise<void> {
         last_seen TEXT NOT NULL
       )`
     ),
-    env.DB.prepare(
+    db.prepare(
       `CREATE TABLE IF NOT EXISTS wr_history (
         track_id TEXT NOT NULL,
         player TEXT NOT NULL,
@@ -227,8 +226,8 @@ async function ensureSchema(env: Env): Promise<void> {
         UNIQUE(track_id, player, time_ms, set_at)
       )`
     ),
-    env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_history_track ON wr_history(track_id, time_ms)'),
-    env.DB.prepare(
+    db.prepare('CREATE INDEX IF NOT EXISTS idx_history_track ON wr_history(track_id, time_ms)'),
+    db.prepare(
       `CREATE TABLE IF NOT EXISTS users (
         user_id TEXT PRIMARY KEY,
         nickname TEXT,
@@ -237,7 +236,7 @@ async function ensureSchema(env: Env): Promise<void> {
         last_seen TEXT NOT NULL DEFAULT (datetime('now'))
       )`
     ),
-    env.DB.prepare(
+    db.prepare(
       `CREATE TABLE IF NOT EXISTS results (
         track_id TEXT NOT NULL,
         user_id TEXT NOT NULL,
@@ -247,13 +246,13 @@ async function ensureSchema(env: Env): Promise<void> {
         PRIMARY KEY (track_id, user_id)
       )`
     ),
-    env.DB.prepare(
+    db.prepare(
       `CREATE TABLE IF NOT EXISTS meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       )`
     ),
-    env.DB.prepare(
+    db.prepare(
       `CREATE TABLE IF NOT EXISTS user_names (
         user_id TEXT NOT NULL,
         nickname TEXT NOT NULL,
@@ -262,7 +261,7 @@ async function ensureSchema(env: Env): Promise<void> {
         PRIMARY KEY (user_id, nickname)
       )`
     ),
-    env.DB.prepare(
+    db.prepare(
       `CREATE TABLE IF NOT EXISTS user_styles (
         user_id TEXT NOT NULL,
         car_style TEXT NOT NULL,
@@ -271,7 +270,7 @@ async function ensureSchema(env: Env): Promise<void> {
         PRIMARY KEY (user_id, car_style)
       )`
     ),
-    env.DB.prepare(
+    db.prepare(
       `CREATE TABLE IF NOT EXISTS snapshots (
         track_id TEXT NOT NULL,
         snap_date TEXT NOT NULL,
@@ -282,7 +281,7 @@ async function ensureSchema(env: Env): Promise<void> {
         PRIMARY KEY (track_id, snap_date, position)
       )`
     ),
-    env.DB.prepare(
+    db.prepare(
       `CREATE TABLE IF NOT EXISTS totw_archive (
         track_id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -292,31 +291,31 @@ async function ensureSchema(env: Env): Promise<void> {
         first_seen TEXT NOT NULL DEFAULT (datetime('now'))
       )`
     ),
-    env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_users_nickname ON users(nickname)'),
-    env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_snapshots_user ON snapshots(user_id)'),
+    db.prepare('CREATE INDEX IF NOT EXISTS idx_users_nickname ON users(nickname)'),
+    db.prepare('CREATE INDEX IF NOT EXISTS idx_snapshots_user ON snapshots(user_id)'),
   ]);
   // Column-level migrations for tables created before a schema extension.
   try {
-    await env.DB.prepare('ALTER TABLE users ADD COLUMN country_code TEXT').run();
+    await db.prepare('ALTER TABLE users ADD COLUMN country_code TEXT').run();
   } catch {
     // column already exists
   }
   try {
-    await env.DB.prepare('ALTER TABLE users ADD COLUMN save_count INTEGER NOT NULL DEFAULT 0').run();
+    await db.prepare('ALTER TABLE users ADD COLUMN save_count INTEGER NOT NULL DEFAULT 0').run();
   } catch {
     // column already exists
   }
   // One-time fold: legacy catalog rows -> users.save_count, then drop the old table.
-  const folded = await env.DB.prepare("SELECT value FROM meta WHERE key = 'catalog_folded'").first<{ value: string }>();
+  const folded = await db.prepare("SELECT value FROM meta WHERE key = 'catalog_folded'").first<{ value: string }>();
   if (!folded) {
-    await env.DB
+    await db
       .prepare(
         `INSERT INTO users (user_id, save_count) SELECT user_id, saved_count FROM catalog
          ON CONFLICT(user_id) DO UPDATE SET save_count = MAX(users.save_count, excluded.save_count)`
       )
       .run();
-    await env.DB.prepare('DROP TABLE IF EXISTS catalog').run();
-    await env.DB
+    await db.prepare('DROP TABLE IF EXISTS catalog').run();
+    await db
       .prepare("INSERT INTO meta (key, value) VALUES ('catalog_folded', '1') ON CONFLICT(key) DO UPDATE SET value = '1'")
       .run();
   }
@@ -333,21 +332,22 @@ interface HistoryRow {
 
 /** WR history endpoints (backed by D1). */
 async function handleHistory(request: Request, url: URL, env: Env): Promise<Response> {
-  if (!env.DB) {
+  const db = env.DB;
+  if (!db) {
     return jsonResponse({ error: 'history unavailable: D1 binding missing' }, 503);
   }
-  await ensureSchema(env);
+  await ensureSchema(db);
 
   if (request.method === 'GET') {
     const trackId = url.searchParams.get('trackId');
     if (trackId) {
-      const { results } = await env.DB
+      const { results } = await db
         .prepare('SELECT track_id, player, time_ms, set_at, recording FROM wr_history WHERE track_id = ?1 ORDER BY set_at ASC')
         .bind(trackId)
         .all<HistoryRow>();
       return jsonResponse({ history: results });
     }
-    const { results } = await env.DB
+    const { results } = await db
       .prepare(
         `SELECT h.track_id, h.player, h.time_ms, h.set_at
          FROM wr_history h
@@ -364,6 +364,8 @@ async function handleHistory(request: Request, url: URL, env: Env): Promise<Resp
     if (!WRITE_ORIGINS.has(origin)) {
       return jsonResponse({ error: 'writes from this origin are not allowed' }, 403);
     }
+    const db = env.DB;
+    if (!db) return jsonResponse({ error: 'history unavailable: D1 binding missing' }, 503);
     let body: { rows?: { trackId?: string; player?: string; timeMs?: number; ts?: string; recording?: string }[] };
     try {
       body = (await request.json()) as typeof body;
@@ -371,19 +373,19 @@ async function handleHistory(request: Request, url: URL, env: Env): Promise<Resp
       return jsonResponse({ error: 'invalid JSON body' }, 400);
     }
     const rows = (body.rows ?? []).filter(
-      (r) =>
-        r.trackId &&
+      (r): r is { trackId: string; player: string; timeMs: number; ts: string; recording?: string } =>
+        r.trackId !== undefined &&
         /^[a-f0-9]{64}$/.test(r.trackId) &&
         typeof r.player === 'string' &&
         typeof r.timeMs === 'number' &&
         typeof r.ts === 'string'
     );
     if (rows.length === 0) return jsonResponse({ error: 'no valid rows' }, 400);
-    const stmt = env.DB.prepare(
+    const stmt = db.prepare(
       `INSERT OR IGNORE INTO wr_history (track_id, player, time_ms, set_at, recording)
        VALUES (?1, ?2, ?3, ?4, ?5)`
     );
-    await env.DB.batch(rows.map((r) => stmt.bind(r.trackId, r.player.slice(0, 80), Math.round(r.timeMs), r.ts, r.recording ?? null)));
+    await db.batch(rows.map((r) => stmt.bind(r.trackId, r.player.slice(0, 80), Math.round(r.timeMs), r.ts, r.recording ?? null)));
     return jsonResponse({ ok: true, ingested: rows.length });
   }
 
@@ -461,13 +463,13 @@ const BACKFILL_TRACKS_PER_RUN = 6; // rotating window: full sweep every ~3 runs
 const BACKFILL_PAGES = 10; // pages of 50 -> 500 extra players per backfilled track
 const API_VERSION = '0.6.3';
 
-async function getCursor(env: Env): Promise<number> {
-  const row = await env.DB.prepare("SELECT value FROM meta WHERE key = 'backfill_cursor'").first<{ value: string }>();
+async function getCursor(db: D1Database): Promise<number> {
+  const row = await db.prepare("SELECT value FROM meta WHERE key = 'backfill_cursor'").first<{ value: string }>();
   return row ? Number(row.value) ?? 0 : 0;
 }
 
-async function setCursor(env: Env, value: number): Promise<void> {
-  await env.DB
+async function setCursor(db: D1Database, value: number): Promise<void> {
+  await db
     .prepare(
       `INSERT INTO meta (key, value) VALUES ('backfill_cursor', ?1)
        ON CONFLICT(key) DO UPDATE SET value = ?1`
@@ -481,19 +483,19 @@ async function setCursor(env: Env, value: number): Promise<void> {
  * Fills in the long tail of players beyond the top 50: every result is stored
  * (best time per user/track) and every player is upserted into users.
  */
-async function backfillTracks(env: Env, cursor: number): Promise<number> {
-  const tracks = OFFICIAL_TRACK_IDS;
+async function backfillTracks(db: D1Database, cursor: number): Promise<number> {
+  const tracks = ALL_TRACK_IDS;
   const window: [string, string][] = [];
   for (let i = 0; i < Math.min(BACKFILL_TRACKS_PER_RUN, tracks.length); i++) {
     window.push(tracks[(cursor + i) % tracks.length]);
   }
 
-  const upsertUser = env.DB.prepare(
+  const upsertUser = db.prepare(
     `INSERT INTO users (user_id, nickname, car_style, last_seen)
      VALUES (?1, ?2, ?3, datetime('now'))
      ON CONFLICT(user_id) DO UPDATE SET last_seen = datetime('now')`
   );
-  const upsertResult = env.DB.prepare(
+  const upsertResult = db.prepare(
     `INSERT INTO results (track_id, user_id, time_ms, verified)
      VALUES (?1, ?2, ?3, ?4)
      ON CONFLICT(track_id, user_id) DO UPDATE SET
@@ -525,14 +527,14 @@ async function backfillTracks(env: Env, cursor: number): Promise<number> {
         for (const e of uniq.values()) {
           stmts.push(upsertUser.bind(e.userId, e.nickname ?? null, e.carStyle ?? null));
         }
-        await env.DB.batch(stmts);
+        await db.batch(stmts);
       } catch (e) {
         console.error(`backfill failed for ${trackId} page ${page}:`, e);
         break;
       }
     }
   }
-  await setCursor(env, (cursor + BACKFILL_TRACKS_PER_RUN) % tracks.length);
+  await setCursor(db, (cursor + BACKFILL_TRACKS_PER_RUN) % tracks.length);
   return seen;
 }
 
@@ -541,9 +543,8 @@ async function backfillTracks(env: Env, cursor: number): Promise<number> {
  * Appends a history row only when the #1 time improved (WR history),
  * and upserts every seen player into the users table.
  */
-async function snapshotLeaderboards(env: Env): Promise<void> {
-  if (!env.DB) return;
-  await ensureSchema(env);
+async function snapshotLeaderboards(db: D1Database): Promise<void> {
+  await ensureSchema(db);
 
   // Archive the current Track of the Week (metadata + its top 50)
   try {
@@ -556,7 +557,7 @@ async function snapshotLeaderboards(env: Env): Promise<void> {
       };
       if (totw.current?.trackId) {
         const c = totw.current;
-        await env.DB
+        await db
           .prepare(
             `INSERT INTO totw_archive (track_id, name, author, environment, end_time)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -575,9 +576,9 @@ async function snapshotLeaderboards(env: Env): Promise<void> {
           const snapDate = new Date().toISOString().slice(0, 10);
           const stmts: D1PreparedStatement[] = [];
           (board.entries ?? []).forEach((e, i) => {
-            stmts.push(...userUpsertStatements(env.DB, e.userId, e.nickname ?? null, e.carStyle ?? null, null));
+            stmts.push(...userUpsertStatements(db, e.userId, e.nickname ?? null, e.carStyle ?? null, null));
             stmts.push(
-              env.DB
+              db
                 .prepare(
                   `INSERT INTO snapshots (track_id, snap_date, position, user_id, time_ms, verified)
                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -587,7 +588,7 @@ async function snapshotLeaderboards(env: Env): Promise<void> {
                 .bind(c.trackId, snapDate, i + 1, e.userId, e.frames ?? 0, e.verifiedState === 1 ? 1 : 0)
             );
           });
-          if (stmts.length > 0) await env.DB.batch(stmts);
+          if (stmts.length > 0) await db.batch(stmts);
         }
       }
     }
@@ -611,9 +612,9 @@ async function snapshotLeaderboards(env: Env): Promise<void> {
       const statements: D1PreparedStatement[] = [];
       const snapDate = new Date().toISOString().slice(0, 10);
       entries.forEach((e, i) => {
-        statements.push(...userUpsertStatements(env.DB, e.userId, e.nickname ?? null, e.carStyle ?? null, null));
+        statements.push(...userUpsertStatements(db, e.userId, e.nickname ?? null, e.carStyle ?? null, null));
         statements.push(
-          env.DB
+          db
             .prepare(
               `INSERT INTO snapshots (track_id, snap_date, position, user_id, time_ms, verified)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -626,13 +627,13 @@ async function snapshotLeaderboards(env: Env): Promise<void> {
 
       // WR history: record the top verified time when it beats the stored best
       const top = entries[0];
-      const best = await env.DB
+      const best = await db
         .prepare('SELECT MIN(time_ms) AS t FROM wr_history WHERE track_id = ?1')
         .bind(trackId)
         .first<{ t: number | null }>();
       if (top.frames && (best?.t == null || top.frames < best.t)) {
         statements.push(
-          env.DB
+          db
             .prepare(
               `INSERT OR IGNORE INTO wr_history (track_id, player, time_ms, set_at, recording)
                VALUES (?1, ?2, ?3, datetime('now'), NULL)`
@@ -640,7 +641,7 @@ async function snapshotLeaderboards(env: Env): Promise<void> {
             .bind(trackId, top.nickname ?? 'unknown', top.frames)
         );
       }
-      await env.DB.batch(statements);
+      await db.batch(statements);
     } catch (e) {
       // one track failing must not kill the run
       console.error(`snapshot failed for ${trackName}:`, e);
@@ -650,16 +651,17 @@ async function snapshotLeaderboards(env: Env): Promise<void> {
 
 /** Player catalog endpoints (backed by D1; 503 when the binding is absent). */
 async function handleCatalog(request: Request, url: URL, env: Env): Promise<Response> {
-  if (!env.DB) {
+  const db = env.DB;
+  if (!db) {
     return jsonResponse({ error: 'catalog unavailable: D1 binding missing' }, 503);
   }
 
-  await ensureSchema(env);
+  await ensureSchema(db);
 
   if (request.method === 'GET') {
-    await ensureSchema(env);
+    await ensureSchema(db);
     const limit = Math.min(Number(url.searchParams.get('limit') ?? 50) || 50, 100);
-    const { results } = await env.DB
+    const { results } = await db
       .prepare('SELECT user_id, nickname, save_count AS saved_count, last_seen FROM users WHERE save_count > 0 ORDER BY save_count DESC, last_seen DESC LIMIT ?')
       .bind(limit)
       .all<CatalogRow>();
@@ -681,8 +683,8 @@ async function handleCatalog(request: Request, url: URL, env: Env): Promise<Resp
     if (!body.userId || !/^[a-f0-9]{64}$/.test(body.userId)) {
       return jsonResponse({ error: 'userId must be a 64-char hex string' }, 400);
     }
-    await ensureSchema(env);
-    await env.DB.batch(userUpsertStatements(env.DB, body.userId, body.nickname ?? null, body.carStyle ?? null, body.countryCode ?? null));
+    await ensureSchema(db);
+    await db.batch(userUpsertStatements(db, body.userId, body.nickname ?? null, body.carStyle ?? null, body.countryCode ?? null));
     return jsonResponse({ ok: true });
   }
 
@@ -695,7 +697,7 @@ async function handleCatalog(request: Request, url: URL, env: Env): Promise<Resp
     if (!userId || !/^[a-f0-9]{64}$/.test(userId)) {
       return jsonResponse({ error: 'userId query param must be 64-char hex' }, 400);
     }
-    await env.DB
+    await db
       .prepare('UPDATE users SET save_count = 0 WHERE user_id = ?1')
       .bind(userId)
       .run();
@@ -719,7 +721,7 @@ async function handleCatalog(request: Request, url: URL, env: Env): Promise<Resp
       return jsonResponse({ error: 'userId must be a 64-char hex string' }, 400);
     }
     const nickname = typeof body.nickname === 'string' ? body.nickname.slice(0, 50) : null;
-    await env.DB
+    await db
       .prepare(
         `INSERT INTO users (user_id, nickname, save_count, last_seen)
          VALUES (?1, ?2, 1, datetime('now'))
@@ -740,14 +742,15 @@ export default {
   async scheduled(controller: { cron: string }, env: Env, ctx: { waitUntil: (p: Promise<unknown>) => void }) {
     ctx.waitUntil(
       (async () => {
-        if (!env.DB) return;
-        await ensureSchema(env);
+        const db = env.DB;
+        if (!db) return;
+        await ensureSchema(db);
         if (controller.cron === '*/15 * * * *') {
-          ctx.waitUntil(wrWatch(env));
+          await wrWatch(db);
         } else if (controller.cron === '0 6 * * *') {
-          ctx.waitUntil(runBackfill(env));
+          await runBackfill(db);
         } else {
-          ctx.waitUntil(runSnapshot(env));
+          await runSnapshot(db);
         }
       })()
     );
@@ -770,16 +773,17 @@ export default {
     if (requestUrl.pathname === '/users/profile') {
       if (request.method !== 'GET') return jsonResponse({ error: 'method not allowed' }, 405);
       if (!env.DB) return jsonResponse({ error: 'users unavailable: D1 binding missing' }, 503);
-      await ensureSchema(env);
+      const db = env.DB;
+      await ensureSchema(db);
       const userId = requestUrl.searchParams.get('userId');
       if (!userId || !/^[a-f0-9]{64}$/.test(userId)) {
         return jsonResponse({ error: 'userId must be 64-char hex' }, 400);
       }
       const [user, names, styles, pbs] = await Promise.all([
-        env.DB.prepare('SELECT * FROM users WHERE user_id = ?1').bind(userId).first(),
-        env.DB.prepare('SELECT nickname, first_seen, last_seen FROM user_names WHERE user_id = ?1 ORDER BY first_seen ASC').bind(userId).all(),
-        env.DB.prepare('SELECT car_style, first_seen, last_seen FROM user_styles WHERE user_id = ?1 ORDER BY first_seen ASC').bind(userId).all(),
-        env.DB.prepare('SELECT r.track_id, r.time_ms, r.verified, r.updated_at FROM results r WHERE r.user_id = ?1 ORDER BY r.time_ms ASC').bind(userId).all(),
+        db.prepare('SELECT * FROM users WHERE user_id = ?1').bind(userId).first(),
+        db.prepare('SELECT nickname, first_seen, last_seen FROM user_names WHERE user_id = ?1 ORDER BY first_seen ASC').bind(userId).all(),
+        db.prepare('SELECT car_style, first_seen, last_seen FROM user_styles WHERE user_id = ?1 ORDER BY first_seen ASC').bind(userId).all(),
+        db.prepare('SELECT r.track_id, r.time_ms, r.verified, r.updated_at FROM results r WHERE r.user_id = ?1 ORDER BY r.time_ms ASC').bind(userId).all(),
       ]);
       return jsonResponse({ user, names: names.results, styles: styles.results, personal_bests: pbs.results });
     }
@@ -801,7 +805,8 @@ export default {
         return handleCatalog(request, requestUrl, env); // PUT upsert shares origin checks
       }
       if (!env.DB) return jsonResponse({ error: 'users unavailable: D1 binding missing' }, 503);
-      await ensureSchema(env);
+      const db = env.DB;
+      await ensureSchema(db);
       const limit = Math.min(Number(requestUrl.searchParams.get('limit') ?? 50) || 50, 200);
       const search = requestUrl.searchParams.get('q');
       const { results } = search
