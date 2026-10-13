@@ -1127,35 +1127,6 @@ export default {
       return handleRun(request, requestUrl, env);
     }
 
-    // Temporary diagnostic: surface the real exception instead of a bare 1101.
-    if (requestUrl.pathname === '/diag') {
-      if (!env.DB) return jsonResponse({ error: 'no DB binding' }, 503);
-      const out: Record<string, unknown> = {};
-      const probe = async (label: string, fn: () => Promise<unknown>) => {
-        try {
-          out[label] = { ok: true, value: await fn() };
-        } catch (err) {
-          out[label] = { ok: false, error: String(err).slice(0, 300) };
-        }
-      };
-      await probe('meta_select', () => env.DB!.prepare("SELECT value FROM meta WHERE key='fts_ready'").first());
-      await probe('fts_table', () => env.DB!.prepare("SELECT name FROM sqlite_master WHERE name='users_fts'").first());
-      await probe('virtual_table_support', async () => {
-        await env.DB!.prepare('CREATE VIRTUAL TABLE IF NOT EXISTS _vt_probe USING fts5(x)').run();
-        await env.DB!.prepare('DROP TABLE IF EXISTS _vt_probe').run();
-        return 'supported';
-      });
-      await probe('like_search', () =>
-        env.DB!.prepare("SELECT user_id FROM users WHERE nickname_lower LIKE ?1 LIMIT 1").bind('%a%').first()
-      );
-      await probe('fts_match', () =>
-        env.DB!.prepare('SELECT f.user_id FROM users_fts f JOIN users u ON u.user_id = f.user_id WHERE users_fts MATCH ?1 LIMIT 1')
-          .bind('"a"*')
-          .first()
-      );
-      return jsonResponse(out);
-    }
-
     if (requestUrl.pathname === '/status') {
       if (request.method !== 'GET') return jsonResponse({ error: 'method not allowed' }, 405);
       if (!env.DB) return jsonResponse({ error: 'status unavailable: D1 binding missing' }, 503);
