@@ -140,9 +140,13 @@ async function handleRun(request: Request, url: URL, env: Env): Promise<Response
     return jsonResponse({ ok: true, skipped: true, reason: 'ran recently', last_run: last.value });
   }
 
-  if (job === 'watch') await wrWatch(db);
-  else if (job === 'snapshot') await runSnapshot(db);
-  else await runBackfill(db);
+  try {
+    if (job === 'watch') await wrWatch(db);
+    else if (job === 'snapshot') await runSnapshot(db);
+    else await runBackfill(db);
+  } catch (e) {
+    return jsonResponse({ error: String(e) }, 500);
+  }
   await db
     .prepare("INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2")
     .bind(key, new Date().toISOString())
