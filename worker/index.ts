@@ -88,6 +88,22 @@ async function ensureSchema(env: Env): Promise<void> {
         last_seen TEXT NOT NULL DEFAULT (datetime('now'))
       )`
     ),
+    env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS results (
+        track_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        time_ms INTEGER NOT NULL,
+        verified INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (track_id, user_id)
+      )`
+    ),
+    env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      )`
+    ),
   ]);
   schemaReady = true;
 }
@@ -180,8 +196,85 @@ const OFFICIAL_TRACK_IDS: [string, string][] = [
   ['Desert 5', 'e5d084e06db4ab71196fea44efeceb23c8561266a78669c324a38f92581fe2db'],
 ];
 
-const SNAPSHOT_DEPTH = 50; // top N players per track per run
+const SNAPSHOT_DEPTH = 50; // top N players per track per run (fresh data)
+const BACKFILL_TRACKS_PER_RUN = 6; // rotating window: full sweep every ~3 runs
+const BACKFILL_PAGES = 10; // pages of 50 -> 500 extra players per backfilled track
 const API_VERSION = '0.6.3';
+
+async function getCursor(env: Env): Promise<number> {
+  const row = await env.DB.prepare("SELECT value FROM meta WHERE key = 'backfill_cursor'").first<{ value: string }>();
+  return row ? Number(row.value) ?? 0 : 0;
+}
+
+async function setCursor(env: Env, value: number): Promise<void> {
+  await env.DB
+    .prepare(
+      `INSERT INTO meta (key, value) VALUES ('backfill_cursor', ?1)
+       ON CONFLICT(key) DO UPDATE SET value = ?1`
+    )
+    .bind(String(value))
+    .run();
+}
+
+/**
+ * Deep-crawl a rotating window of tracks, paging deep into their leaderboards.
+ * Fills in the long tail of players beyond the top 50: every result is stored
+ * (best time per user/track) and every player is upserted into users.
+ */
+async function backfillTracks(env: Env, cursor: number): Promise<number> {
+  const tracks = OFFICIAL_TRACK_IDS;
+  const window: [string, string][] = [];
+  for (let i = 0; i < Math.min(BACKFILL_TRACKS_PER_RUN, tracks.length); i++) {
+    window.push(tracks[(cursor + i) % tracks.length]);
+  }
+
+  const upsertUser = env.DB.prepare(
+    `INSERT INTO users (user_id, nickname, car_style, last_seen)
+     VALUES (?1, ?2, ?3, datetime('now'))
+     ON CONFLICT(user_id) DO UPDATE SET last_seen = datetime('now')`
+  );
+  const upsertResult = env.DB.prepare(
+    `INSERT INTO results (track_id, user_id, time_ms, verified)
+     VALUES (?1, ?2, ?3, ?4)
+     ON CONFLICT(track_id, user_id) DO UPDATE SET
+       time_ms = MIN(time_ms, excluded.time_ms),
+       verified = MAX(verified, excluded.verified),
+       updated_at = datetime('now')`
+  );
+
+  let seen = 0;
+  for (const [, trackId] of window) {
+    for (let page = 1; page <= BACKFILL_PAGES; page++) {
+      try {
+        const res = await fetch(
+          `https://vps.kodub.com/v6/leaderboard?version=${API_VERSION}&trackId=${trackId}&skip=${page * SNAPSHOT_DEPTH}&amount=${SNAPSHOT_DEPTH}&onlyVerified=false`,
+          { headers: { Origin: GAME_ORIGIN } }
+        );
+        if (!res.ok) break;
+        const data = (await res.json()) as {
+          entries?: { userId: string; nickname?: string; carStyle?: string; frames?: number; verifiedState?: number }[];
+        };
+        const entries = data.entries ?? [];
+        if (entries.length === 0) break; // ran past the end of this board
+        const stmts = entries.map((e) => {
+          seen += 1;
+          return upsertResult.bind(trackId, e.userId, e.frames ?? 0, e.verifiedState === 1 ? 1 : 0);
+        });
+        // one user row per entry, deduped in-memory per page
+        const uniq = new Map(entries.map((e) => [e.userId, e]));
+        for (const e of uniq.values()) {
+          stmts.push(upsertUser.bind(e.userId, e.nickname ?? null, e.carStyle ?? null));
+        }
+        await env.DB.batch(stmts);
+      } catch (e) {
+        console.error(`backfill failed for ${trackId} page ${page}:`, e);
+        break;
+      }
+    }
+  }
+  await setCursor(env, (cursor + BACKFILL_TRACKS_PER_RUN) % tracks.length);
+  return seen;
+}
 
 /**
  * Cron: snapshot the top of every official leaderboard into D1.
@@ -341,7 +434,15 @@ async function handleCatalog(request: Request, url: URL, env: Env): Promise<Resp
 
 export default {
   async scheduled(_controller: unknown, env: Env, ctx: { waitUntil: (p: Promise<unknown>) => void }) {
-    ctx.waitUntil(snapshotLeaderboards(env));
+    ctx.waitUntil(
+      (async () => {
+        await snapshotLeaderboards(env);
+        if (!env.DB) return;
+        const cursor = await getCursor(env);
+        const seen = await backfillTracks(env, cursor);
+        console.log(`backfill pass done: cursor ${cursor}, ${seen} results seen`);
+      })()
+    );
   },
 
   async fetch(request: Request, env: Env): Promise<Response> {
