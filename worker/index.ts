@@ -441,7 +441,7 @@ const ALL_TRACK_IDS: [string, string][] = [
   ['Anubis', '86335d78d1a06d3dc81d80f84b8ac2e8f6359e9a206826e2c36f7d3f4351bea4'],
   ['Natsujō', 'a510bbd3341f2992a12db8a3780cb8943b6087538345d58d16602d6129742df0'],
   ['Arabica', '8cf99166f12cbb56a9df4e022a0e9b8c78973adb929dbf1e265ebb9f99f01163'],
-  ['Hyperion's Sanctuary', '33d99aad2ad5cef45b1d3afb8735c5229cfd98ac7cc24916e0da7283f7a545ce'],
+  ["Hyperion's Sanctuary", '33d99aad2ad5cef45b1d3afb8735c5229cfd98ac7cc24916e0da7283f7a545ce'],
   ['Winter Hollow', '5c00f2c90bcf8230183484225d1a417e45b0ad310379acfafd4c8f1dc7345dd7'],
   ['Clay temples', '009fad7fcc215022c6b2dbb2b6de622f07cd88d4930b8e2b6a6b74c1f5de9e44'],
   ['Las Calles', '1ad53694ee3e96aea27afa7b64d5c29d115de88a17b69cf3fe3f5609c52b040b'],
