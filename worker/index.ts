@@ -55,6 +55,59 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+/** Upsert a user, capturing nickname/color history on change. */
+function userUpsertStatements(
+  db: D1Database,
+  userId: string,
+  nickname: string | null,
+  carStyle: string | null,
+  countryCode?: string | null
+) {
+  return [
+    db
+      .prepare(
+        `INSERT INTO users (user_id, nickname, car_style, country_code, last_seen)
+         VALUES (?1, ?2, ?3, ?4, datetime('now'))
+         ON CONFLICT(user_id) DO UPDATE SET
+           nickname = COALESCE(?2, nickname),
+           car_style = COALESCE(?3, car_style),
+           country_code = COALESCE(?4, country_code),
+           last_seen = datetime('now')`
+      )
+      .bind(userId, nickname, carStyle, countryCode ?? null),
+    // name history: append when this nickname isn't already recorded
+    db
+      .prepare(
+        `INSERT INTO user_names (user_id, nickname, last_seen)
+         SELECT ?1, ?2, datetime('now')
+         WHERE ?2 IS NOT NULL AND NOT EXISTS (
+           SELECT 1 FROM user_names WHERE user_id = ?1 AND nickname = ?2
+         )`
+      )
+      .bind(userId, nickname),
+    db
+      .prepare(
+        `UPDATE user_names SET last_seen = datetime('now') WHERE user_id = ?1 AND nickname = ?2`
+      )
+      .bind(userId, nickname),
+    // car style history: same pattern
+    db
+      .prepare(
+        `INSERT INTO user_styles (user_id, car_style, last_seen)
+         SELECT ?1, ?2, datetime('now')
+         WHERE ?2 IS NOT NULL AND NOT EXISTS (
+           SELECT 1 FROM user_styles WHERE user_id = ?1 AND car_style = ?2
+         )`
+      )
+      .bind(userId, carStyle),
+    db
+      .prepare(
+        `UPDATE user_styles SET last_seen = datetime('now') WHERE user_id = ?1 AND car_style = ?2`
+      )
+      .bind(userId, carStyle),
+  ];
+}
+
 /** Create the catalog table on first use (zero-touch migrations). */
 let schemaReady = false;
 async function ensureSchema(env: Env): Promise<void> {
@@ -104,6 +157,47 @@ async function ensureSchema(env: Env): Promise<void> {
         value TEXT NOT NULL
       )`
     ),
+    env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS user_names (
+        user_id TEXT NOT NULL,
+        nickname TEXT NOT NULL,
+        first_seen TEXT NOT NULL DEFAULT (datetime('now')),
+        last_seen TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (user_id, nickname)
+      )`
+    ),
+    env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS user_styles (
+        user_id TEXT NOT NULL,
+        car_style TEXT NOT NULL,
+        first_seen TEXT NOT NULL DEFAULT (datetime('now')),
+        last_seen TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (user_id, car_style)
+      )`
+    ),
+    env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS snapshots (
+        track_id TEXT NOT NULL,
+        snap_date TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        user_id TEXT NOT NULL,
+        time_ms INTEGER NOT NULL,
+        verified INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (track_id, snap_date, position)
+      )`
+    ),
+    env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS totw_archive (
+        track_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        author TEXT,
+        environment INTEGER,
+        end_time TEXT,
+        first_seen TEXT NOT NULL DEFAULT (datetime('now'))
+      )`
+    ),
+    env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_users_nickname ON users(nickname)'),
+    env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_snapshots_user ON snapshots(user_id)'),
   ]);
   schemaReady = true;
 }
@@ -285,14 +379,55 @@ async function snapshotLeaderboards(env: Env): Promise<void> {
   if (!env.DB) return;
   await ensureSchema(env);
 
-  const upsertUser = env.DB.prepare(
-    `INSERT INTO users (user_id, nickname, car_style, last_seen)
-     VALUES (?1, ?2, ?3, datetime('now'))
-     ON CONFLICT(user_id) DO UPDATE SET
-       nickname = COALESCE(?2, nickname),
-       car_style = COALESCE(?3, car_style),
-       last_seen = datetime('now')`
-  );
+  // Archive the current Track of the Week (metadata + its top 50)
+  try {
+    const totwRes = await fetch(`https://vps.kodub.com/v6/trackOfTheWeek?version=${API_VERSION}`, {
+      headers: { Origin: GAME_ORIGIN },
+    });
+    if (totwRes.ok) {
+      const totw = (await totwRes.json()) as {
+        current?: { trackId: string; name: string; author?: string; environment?: number; endTime?: string };
+      };
+      if (totw.current?.trackId) {
+        const c = totw.current;
+        await env.DB
+          .prepare(
+            `INSERT INTO totw_archive (track_id, name, author, environment, end_time)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(track_id) DO UPDATE SET name = ?2, author = ?3, end_time = ?5`
+          )
+          .bind(c.trackId, c.name, c.author ?? null, c.environment ?? null, c.endTime ?? null)
+          .run();
+        const totwBoard = await fetch(
+          `https://vps.kodub.com/v6/leaderboard?version=${API_VERSION}&trackId=${c.trackId}&skip=0&amount=${SNAPSHOT_DEPTH}&onlyVerified=false`,
+          { headers: { Origin: GAME_ORIGIN } }
+        );
+        if (totwBoard.ok) {
+          const board = (await totwBoard.json()) as {
+            entries?: { userId: string; nickname?: string; carStyle?: string; frames?: number; verifiedState?: number }[];
+          };
+          const snapDate = new Date().toISOString().slice(0, 10);
+          const stmts: D1PreparedStatement[] = [];
+          (board.entries ?? []).forEach((e, i) => {
+            stmts.push(...userUpsertStatements(env.DB, e.userId, e.nickname ?? null, e.carStyle ?? null, null));
+            stmts.push(
+              env.DB
+                .prepare(
+                  `INSERT INTO snapshots (track_id, snap_date, position, user_id, time_ms, verified)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                   ON CONFLICT(track_id, snap_date, position) DO UPDATE SET
+                     user_id = excluded.user_id, time_ms = excluded.time_ms, verified = excluded.verified`
+                )
+                .bind(c.trackId, snapDate, i + 1, e.userId, e.frames ?? 0, e.verifiedState === 1 ? 1 : 0)
+            );
+          });
+          if (stmts.length > 0) await env.DB.batch(stmts);
+        }
+      }
+    }
+  } catch (e) {
+    console.error('TOTW archive failed:', e);
+  }
 
   for (const [trackName, trackId] of OFFICIAL_TRACK_IDS) {
     try {
@@ -307,9 +442,21 @@ async function snapshotLeaderboards(env: Env): Promise<void> {
       const entries = data.entries ?? [];
       if (entries.length === 0) continue;
 
-      const statements = entries.map((e) =>
-        upsertUser.bind(e.userId, e.nickname ?? null, e.carStyle ?? null)
-      );
+      const statements: D1PreparedStatement[] = [];
+      const snapDate = new Date().toISOString().slice(0, 10);
+      entries.forEach((e, i) => {
+        statements.push(...userUpsertStatements(env.DB, e.userId, e.nickname ?? null, e.carStyle ?? null, null));
+        statements.push(
+          env.DB
+            .prepare(
+              `INSERT INTO snapshots (track_id, snap_date, position, user_id, time_ms, verified)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+               ON CONFLICT(track_id, snap_date, position) DO UPDATE SET
+                 user_id = excluded.user_id, time_ms = excluded.time_ms, verified = excluded.verified`
+            )
+            .bind(trackId, snapDate, i + 1, e.userId, e.frames ?? 0, e.verifiedState === 1 ? 1 : 0)
+        );
+      });
 
       // WR history: record the top verified time when it beats the stored best
       const top = entries[0];
@@ -358,7 +505,7 @@ async function handleCatalog(request: Request, url: URL, env: Env): Promise<Resp
     if (!WRITE_ORIGINS.has(origin)) {
       return jsonResponse({ error: 'writes from this origin are not allowed' }, 403);
     }
-    let body: { userId?: string; nickname?: string; carStyle?: string };
+    let body: { userId?: string; nickname?: string; carStyle?: string; countryCode?: string };
     try {
       body = (await request.json()) as typeof body;
     } catch {
@@ -368,17 +515,7 @@ async function handleCatalog(request: Request, url: URL, env: Env): Promise<Resp
       return jsonResponse({ error: 'userId must be a 64-char hex string' }, 400);
     }
     await ensureSchema(env);
-    await env.DB
-      .prepare(
-        `INSERT INTO users (user_id, nickname, car_style, last_seen)
-         VALUES (?1, ?2, ?3, datetime('now'))
-         ON CONFLICT(user_id) DO UPDATE SET
-           nickname = COALESCE(?2, nickname),
-           car_style = COALESCE(?3, car_style),
-           last_seen = datetime('now')`
-      )
-      .bind(body.userId, body.nickname ?? null, body.carStyle ?? null)
-      .run();
+    await env.DB.batch(userUpsertStatements(env.DB, body.userId, body.nickname ?? null, body.carStyle ?? null, body.countryCode ?? null));
     return jsonResponse({ ok: true });
   }
 
@@ -459,6 +596,23 @@ export default {
     if (requestUrl.pathname === '/history') {
       return handleHistory(request, requestUrl, env);
     }
+    if (requestUrl.pathname === '/users/profile') {
+      if (request.method !== 'GET') return jsonResponse({ error: 'method not allowed' }, 405);
+      if (!env.DB) return jsonResponse({ error: 'users unavailable: D1 binding missing' }, 503);
+      await ensureSchema(env);
+      const userId = requestUrl.searchParams.get('userId');
+      if (!userId || !/^[a-f0-9]{64}$/.test(userId)) {
+        return jsonResponse({ error: 'userId must be 64-char hex' }, 400);
+      }
+      const [user, names, styles, pbs] = await Promise.all([
+        env.DB.prepare('SELECT * FROM users WHERE user_id = ?1').bind(userId).first(),
+        env.DB.prepare('SELECT nickname, first_seen, last_seen FROM user_names WHERE user_id = ?1 ORDER BY first_seen ASC').bind(userId).all(),
+        env.DB.prepare('SELECT car_style, first_seen, last_seen FROM user_styles WHERE user_id = ?1 ORDER BY first_seen ASC').bind(userId).all(),
+        env.DB.prepare('SELECT r.track_id, r.time_ms, r.verified, r.updated_at FROM results r WHERE r.user_id = ?1 ORDER BY r.time_ms ASC').bind(userId).all(),
+      ]);
+      return jsonResponse({ user, names: names.results, styles: styles.results, personal_bests: pbs.results });
+    }
+
     if (requestUrl.pathname === '/users') {
       if (request.method !== 'GET') {
         return handleCatalog(request, requestUrl, env); // PUT upsert shares origin checks
