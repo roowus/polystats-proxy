@@ -284,11 +284,13 @@ async function ensureSchema(db: D1Database): Promise<void> {
     db.prepare('CREATE INDEX IF NOT EXISTS idx_users_nickname ON users(nickname)'),
     db.prepare('CREATE INDEX IF NOT EXISTS idx_snapshots_user ON snapshots(user_id)'),
   ];
-  for (const stmt of ddl) {
+  for (let i = 0; i < ddl.length; i++) {
     try {
-      await stmt.run();
-    } catch {
-      // "already exists" — expected on every run after the first
+      await ddl[i].run();
+    } catch (e) {
+      const msg = String(e);
+      if (/already exists/i.test(msg)) continue;
+      throw new Error(`ensureSchema statement ${i} failed: ${msg}`);
     }
   }
   // One-time fold: legacy catalog rows -> users.save_count, then drop the old table.
