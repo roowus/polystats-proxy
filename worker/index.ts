@@ -25,7 +25,7 @@ const WRITE_ORIGINS = new Set([
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type',
 };
 
@@ -87,6 +87,19 @@ async function handleCatalog(request: Request, url: URL, env: Env): Promise<Resp
       .bind(limit)
       .all<CatalogRow>();
     return jsonResponse({ users: results });
+  }
+
+  if (request.method === 'DELETE') {
+    const origin = request.headers.get('Origin') ?? '';
+    if (!WRITE_ORIGINS.has(origin)) {
+      return jsonResponse({ error: 'writes from this origin are not allowed' }, 403);
+    }
+    const userId = url.searchParams.get('userId');
+    if (!userId || !/^[a-f0-9]{64}$/.test(userId)) {
+      return jsonResponse({ error: 'userId query param must be 64-char hex' }, 400);
+    }
+    await env.DB.prepare('DELETE FROM catalog WHERE user_id = ?1').bind(userId).run();
+    return jsonResponse({ ok: true });
   }
 
   if (request.method === 'POST') {
