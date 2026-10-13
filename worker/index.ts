@@ -39,6 +39,8 @@ const CORS_HEADERS = {
 interface Env {
   /** D1 database binding (see wrangler.toml). Catalog features degrade without it. */
   DB?: D1Database;
+  /** Optional shared secret for /run (external schedulers). Set via `wrangler secret put`. */
+  SCHEDULE_TOKEN?: string;
 }
 
 interface CatalogRow {
@@ -53,6 +55,100 @@ function jsonResponse(body: unknown, status = 200): Response {
     status,
     headers: { ...CORS, 'Content-Type': 'application/json' },
   });
+}
+
+/** WR watch: cheap — only writes when a record actually falls. */
+async function wrWatch(env: Env): Promise<void> {
+  if (!env.DB) return;
+  await ensureSchema(env);
+  let broken = 0;
+  for (const [, trackId] of ALL_TRACK_IDS) {
+    try {
+      const res = await fetch(
+        `https://vps.kodub.com/v6/leaderboard?version=${API_VERSION}&trackId=${trackId}&skip=0&amount=1&onlyVerified=true`,
+        { headers: { Origin: GAME_ORIGIN } }
+      );
+      if (!res.ok) continue;
+      const data = (await res.json()) as { entries?: { userId: string; nickname?: string; frames?: number }[] };
+      const top = data.entries?.[0];
+      if (!top?.frames) continue;
+      const best = await env.DB.prepare('SELECT MIN(time_ms) AS t FROM wr_history WHERE track_id = ?1').bind(trackId).first<{ t: number | null }>();
+      if (best?.t == null || top.frames < best.t) {
+        await env.DB
+          .prepare(
+            `INSERT OR IGNORE INTO wr_history (track_id, player, time_ms, set_at, recording)
+             VALUES (?1, ?2, ?3, datetime('now'), NULL)`
+          )
+          .bind(trackId, top.nickname ?? 'unknown', top.frames)
+          .run();
+        broken += 1;
+      }
+    } catch (e) {
+      console.error('WR watch failed for', trackId, e);
+    }
+  }
+  await env.DB
+    .prepare("INSERT INTO meta (key, value) VALUES ('last_wr_watch', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1")
+    .bind(new Date().toISOString())
+    .run();
+  if (broken > 0) console.log(`WR watch: ${broken} record(s) broken`);
+}
+
+/** Full top-50 snapshot of every track + TOTW archive. */
+async function runSnapshot(env: Env): Promise<void> {
+  if (!env.DB) return;
+  await snapshotLeaderboards(env);
+  await env.DB
+    .prepare("INSERT INTO meta (key, value) VALUES ('last_fresh_run', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1")
+    .bind(new Date().toISOString())
+    .run();
+}
+
+/** Daily backfill: deep-crawl the long tail. */
+async function runBackfill(env: Env): Promise<void> {
+  if (!env.DB) return;
+  await ensureSchema(env);
+  const cursor = await getCursor(env);
+  const seen = await backfillTracks(env, cursor);
+  await env.DB
+    .prepare("INSERT INTO meta (key, value) VALUES ('last_backfill_run', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1")
+    .bind(new Date().toISOString())
+    .run();
+  console.log(`backfill pass done: cursor ${cursor}, ${seen} results seen`);
+}
+
+/**
+ * HTTP-triggered jobs for external schedulers (GitHub Actions, cron-job.org…).
+ * Guarded by SCHEDULE_TOKEN and a minimum-interval so double-fires and
+ * strangers can't burn the D1 write budget.
+ */
+async function handleRun(request: Request, url: URL, env: Env): Promise<Response> {
+  const job = url.searchParams.get('job');
+  if (job !== 'watch' && job !== 'snapshot' && job !== 'backfill') {
+    return jsonResponse({ error: "job must be 'watch' | 'snapshot' | 'backfill'" }, 400);
+  }
+  if (env.SCHEDULE_TOKEN) {
+    const token = url.searchParams.get('token') ?? request.headers.get('X-Schedule-Token');
+    if (token !== env.SCHEDULE_TOKEN) {
+      return jsonResponse({ error: 'unauthorized' }, 401);
+    }
+  }
+  // Min-interval guard: skip if this job ran recently (idempotent + abuse-proof).
+  const intervals: Record<string, number> = { watch: 10 * 60 * 1000, snapshot: 5 * 3600 * 1000, backfill: 20 * 3600 * 1000 };
+  const key = `last_run_${job}`;
+  const last = await env.DB.prepare('SELECT value FROM meta WHERE key = ?1').bind(key).first<{ value: string }>();
+  if (last?.value && Date.now() - new Date(last.value).getTime() < intervals[job]) {
+    return jsonResponse({ ok: true, skipped: true, reason: 'ran recently', last_run: last.value });
+  }
+
+  if (job === 'watch') await wrWatch(env);
+  else if (job === 'snapshot') await runSnapshot(env);
+  else await runBackfill(env);
+  await env.DB
+    .prepare("INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2")
+    .bind(key, new Date().toISOString())
+    .run();
+  return jsonResponse({ ok: true, job });
 }
 
 /** Upsert a user, capturing nickname/color history on change. */
@@ -647,54 +743,11 @@ export default {
         if (!env.DB) return;
         await ensureSchema(env);
         if (controller.cron === '*/15 * * * *') {
-          // WR watch: cheap — only writes when a record actually falls.
-          let broken = 0;
-          for (const [, trackId] of ALL_TRACK_IDS) {
-            try {
-              const res = await fetch(
-                `https://vps.kodub.com/v6/leaderboard?version=${API_VERSION}&trackId=${trackId}&skip=0&amount=1&onlyVerified=true`,
-                { headers: { Origin: GAME_ORIGIN } }
-              );
-              if (!res.ok) continue;
-              const data = (await res.json()) as { entries?: { userId: string; nickname?: string; frames?: number }[] };
-              const top = data.entries?.[0];
-              if (!top?.frames) continue;
-              const best = await env.DB.prepare('SELECT MIN(time_ms) AS t FROM wr_history WHERE track_id = ?1').bind(trackId).first<{ t: number | null }>();
-              if (best?.t == null || top.frames < best.t) {
-                await env.DB
-                  .prepare(
-                    `INSERT OR IGNORE INTO wr_history (track_id, player, time_ms, set_at, recording)
-                     VALUES (?1, ?2, ?3, datetime('now'), NULL)`
-                  )
-                  .bind(trackId, top.nickname ?? 'unknown', top.frames)
-                  .run();
-                broken += 1;
-              }
-            } catch (e) {
-              console.error('WR watch failed for', trackId, e);
-            }
-          }
-          await env.DB
-            .prepare("INSERT INTO meta (key, value) VALUES ('last_wr_watch', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1")
-            .bind(new Date().toISOString())
-            .run();
-          if (broken > 0) console.log(`WR watch: ${broken} record(s) broken`);
+          ctx.waitUntil(wrWatch(env));
         } else if (controller.cron === '0 6 * * *') {
-          // Daily backfill: deep-crawl the long tail.
-          const cursor = await getCursor(env);
-          const seen = await backfillTracks(env, cursor);
-          await env.DB
-            .prepare("INSERT INTO meta (key, value) VALUES ('last_backfill_run', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1")
-            .bind(new Date().toISOString())
-            .run();
-          console.log(`backfill pass done: cursor ${cursor}, ${seen} results seen`);
+          ctx.waitUntil(runBackfill(env));
         } else {
-          // 6-hourly full snapshot: top-50 of every track + TOTW archive.
-          await snapshotLeaderboards(env);
-          await env.DB
-            .prepare("INSERT INTO meta (key, value) VALUES ('last_fresh_run', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1")
-            .bind(new Date().toISOString())
-            .run();
+          ctx.waitUntil(runSnapshot(env));
         }
       })()
     );
@@ -729,6 +782,10 @@ export default {
         env.DB.prepare('SELECT r.track_id, r.time_ms, r.verified, r.updated_at FROM results r WHERE r.user_id = ?1 ORDER BY r.time_ms ASC').bind(userId).all(),
       ]);
       return jsonResponse({ user, names: names.results, styles: styles.results, personal_bests: pbs.results });
+    }
+
+    if (requestUrl.pathname === '/run') {
+      return handleRun(request, requestUrl, env);
     }
 
     if (requestUrl.pathname === '/status') {
