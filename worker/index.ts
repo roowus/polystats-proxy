@@ -329,13 +329,145 @@ export function buildFtsQuery(term: string): string {
  * keep working. The fallback is the expensive path, so it only runs when the
  * cheap one found nothing.
  */
+/**
+ * Fetch a player's current profile straight from the PolyTrack API.
+ *
+ * Only works with a user id hash or user token: the game API has no nickname
+ * search (`userToken=<nickname>` returns `null`), so a name lookup can only ever
+ * be served from our own catalog.
+ *
+ * Returns null when the API has no such player, or on any network failure.
+ */
+async function fetchLiveProfile(
+  userId: string
+): Promise<{ nickname: string | null; carStyle: string | null; countryCode: string | null } | null> {
+  try {
+    const res = await fetch(
+      `https://vps.kodub.com/v6/user?version=${API_VERSION}&userToken=${encodeURIComponent(userId)}`,
+      { headers: { Origin: GAME_ORIGIN } }
+    );
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      nickname?: string | null;
+      carStyle?: string | null;
+      countryCode?: string | null;
+    } | null;
+    if (!data || typeof data !== 'object') return null;
+    return {
+      nickname: typeof data.nickname === 'string' ? data.nickname : null,
+      carStyle: typeof data.carStyle === 'string' ? data.carStyle : null,
+      countryCode: typeof data.countryCode === 'string' ? data.countryCode : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** How stale a stored profile may be before we re-check it upstream. */
+const PROFILE_TTL_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Cap on expensive full-scan searches per isolate per day.
+ *
+ * The scrapers and search share one database, and they share the daily row-read
+ * allowance. A burst of short-fragment searches used to be able to spend the
+ * whole budget and take data collection down with it, so scans are rationed
+ * here: past the cap, search keeps working on the FTS path and simply returns
+ * fewer results rather than starving the collectors.
+ *
+ * Isolate-local and best-effort by design — a rough brake, not a hard quota.
+ */
+const SCAN_BUDGET_PER_ISOLATE = 200;
+let scansUsed = 0;
+let scanWindowDay = new Date().toISOString().slice(0, 10);
+
+function mayRunExpensiveScan(): boolean {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== scanWindowDay) {
+    scanWindowDay = today;
+    scansUsed = 0;
+  }
+  if (scansUsed >= SCAN_BUDGET_PER_ISOLATE) return false;
+  scansUsed++;
+  return true;
+}
+
+/**
+ * Bring one stored player up to date from the game API.
+ *
+ * Called with `waitUntil` so the response is not delayed: callers serve the
+ * stored row immediately and this refreshes it for next time.
+ *
+ * Deliberately conservative about D1 reads (the scarce meter): only runs for a
+ * single user id, only when the stored row is older than the TTL, and only
+ * writes when a value actually changed, so a no-op refresh costs no writes.
+ */
+async function refreshUserFromApi(db: D1Database, userId: string): Promise<void> {
+  const row = await db
+    .prepare('SELECT nickname, car_style, country_code, last_seen FROM users WHERE user_id = ?1')
+    .bind(userId)
+    .first<{ nickname: string | null; car_style: string | null; country_code: string | null; last_seen: string | null }>();
+
+  if (row?.last_seen) {
+    const seen = Date.parse(row.last_seen.replace(' ', 'T') + (row.last_seen.endsWith('Z') ? '' : 'Z'));
+    if (Number.isFinite(seen) && Date.now() - seen < PROFILE_TTL_MS) return;
+  }
+
+  const live = await fetchLiveProfile(userId);
+  if (!live) return;
+
+  const nicknameChanged = live.nickname != null && live.nickname !== row?.nickname;
+  const styleChanged = live.carStyle != null && live.carStyle !== row?.car_style;
+  if (!nicknameChanged && !styleChanged) {
+    // Nothing new: just note that we checked.
+    await db.prepare('UPDATE users SET last_seen = datetime(\'now\') WHERE user_id = ?1').bind(userId).run();
+    return;
+  }
+
+  await db
+    .prepare(
+      `INSERT INTO users (user_id, nickname, nickname_lower, car_style, country_code, last_seen)
+       VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
+       ON CONFLICT(user_id) DO UPDATE SET
+         nickname = COALESCE(?2, nickname),
+         nickname_lower = COALESCE(?3, nickname_lower),
+         car_style = COALESCE(?4, car_style),
+         country_code = COALESCE(?5, country_code),
+         last_seen = datetime('now')`
+    )
+    .bind(userId, live.nickname, live.nickname?.toLowerCase() ?? null, live.carStyle, live.countryCode)
+    .run();
+
+  // Keep the search index aligned with a changed name.
+  if (nicknameChanged) {
+    await db.prepare('DELETE FROM users_fts WHERE user_id = ?1').bind(userId).run();
+    await db
+      .prepare('INSERT INTO users_fts (nickname_lower, user_id) SELECT ?1, ?2 WHERE ?1 IS NOT NULL AND ?1 <> ""')
+      .bind(live.nickname!.toLowerCase(), userId)
+      .run();
+  }
+}
+
 async function searchUsers(
   db: D1Database,
   term: string,
-  limit: number
+  limit: number,
+  /** Runs in the background so a refresh never delays the response. */
+  background?: (p: Promise<unknown>) => void
 ): Promise<{ results: Record<string, unknown>[] }> {
   const lowered = term.toLowerCase();
   const ftsQuery = buildFtsQuery(term);
+
+  /** Serve stored rows now, refresh them for next time. */
+  const withRefresh = (results: Record<string, unknown>[]) => {
+    if (background) {
+      for (const r of results) {
+        const id = r.user_id;
+        if (typeof id === 'string') background(refreshUserFromApi(db, id));
+      }
+    }
+    return { results };
+  };
 
   if (ftsQuery) {
     try {
@@ -350,19 +482,41 @@ async function searchUsers(
         )
         .bind(ftsQuery, limit)
         .all();
-      if (results && results.length > 0) return { results };
+      if (results && results.length > 0) return withRefresh(results);
     } catch (err) {
       // Malformed MATCH or a missing index — fall through to LIKE.
       console.error('FTS search failed, using LIKE:', String(err));
     }
   }
 
-  return db
+  // Suffix/substring fallback.
+  //
+  // This is the expensive path: a leading wildcard cannot use an index, so
+  // SQLite scans every row in `users`. That is what exhausted the daily
+  // row-read allowance and, because the scrapers share the database, it stopped
+  // data collection too.
+  //
+  // So it is gated:
+  //   - only for terms long enough to be a deliberate fragment, never a single
+  //     character (the common case, and the one a user retypes most)
+  //   - skipped entirely when FTS is working and simply found nothing short,
+  //     unless the term is long enough to be worth the scan
+  const MIN_SCAN_LENGTH = 4;
+  if (lowered.length < MIN_SCAN_LENGTH) {
+    return { results: [] };
+  }
+  if (!mayRunExpensiveScan()) {
+    // Budget spent: prefer returning nothing over starving the collectors.
+    return { results: [] };
+  }
+
+  const { results } = await db
     .prepare(
       "SELECT user_id, nickname, car_style, last_seen FROM users WHERE nickname_lower LIKE ?1 ORDER BY last_seen DESC LIMIT ?2"
     )
     .bind(`%${lowered}%`, limit)
     .all();
+  return withRefresh(results);
 }
 
 /** Create the catalog table on first use (zero-touch migrations). */
@@ -1055,7 +1209,7 @@ export default {
     );
   },
 
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: { ...CORS_HEADERS, ...CORS } });
     }
@@ -1081,6 +1235,20 @@ export default {
       if (!userId || !/^[a-f0-9]{64}$/.test(userId)) {
         return jsonResponse({ error: 'userId must be 64-char hex' }, 400);
       }
+
+      // A pasted user id is an explicit ask for this player, and it is one of the
+      // few lookups the game API can actually answer (there is no nickname
+      // search). Refresh first so the page shows current data, then fall back to
+      // stored rows if upstream is unavailable. A player we have never seen is
+      // inserted here, so looking someone up adds them to the catalog.
+      await ctx.waitUntil(refreshUserFromApi(db, userId).catch(() => {}));
+      const fresh = await db.prepare('SELECT * FROM users WHERE user_id = ?1').bind(userId).first();
+      if (!fresh) {
+        // First sighting: write the profile now rather than waiting on the
+        // background task, so the page has something to render.
+        await refreshUserFromApi(db, userId).catch(() => {});
+      }
+
       const [user, names, styles, pbs] = await Promise.all([
         db.prepare('SELECT * FROM users WHERE user_id = ?1').bind(userId).first(),
         db.prepare('SELECT nickname, first_seen, last_seen FROM user_names WHERE user_id = ?1 ORDER BY first_seen ASC').bind(userId).all(),
@@ -1162,8 +1330,11 @@ export default {
       await ensureSchema(db);
       const limit = Math.min(Number(requestUrl.searchParams.get('limit') ?? 50) || 50, 200);
       const search = requestUrl.searchParams.get('q');
+      // Stored rows answer immediately; any that are stale are re-checked
+      // against the game API in the background for the next call.
+      const background = (p: Promise<unknown>) => ctx.waitUntil(p.catch(() => {}));
       const { results } = search
-        ? await searchUsers(db, search, limit)
+        ? await searchUsers(db, search, limit, background)
         : await env.DB
             .prepare('SELECT user_id, nickname, car_style, last_seen FROM users ORDER BY last_seen DESC LIMIT ?1')
             .bind(limit)
