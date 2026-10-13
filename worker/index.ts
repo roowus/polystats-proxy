@@ -365,7 +365,6 @@ async function ensureSchema(db: D1Database): Promise<void> {
       first_seen TEXT NOT NULL DEFAULT (datetime('now'))
     )`),
     db.prepare('CREATE INDEX IF NOT EXISTS idx_users_nickname ON users(nickname)'),
-    db.prepare('CREATE INDEX IF NOT EXISTS idx_users_nicklower ON users(nickname_lower)'),
     db.prepare('CREATE INDEX IF NOT EXISTS idx_snapshots_user ON snapshots(user_id)'),
   ];
   for (let i = 0; i < ddl.length; i++) {
@@ -387,6 +386,12 @@ async function ensureSchema(db: D1Database): Promise<void> {
     } catch {
       // duplicate column — already applied
     }
+  }
+  // Indexes on migrated columns go AFTER the columns exist.
+  try {
+    await db.prepare('CREATE INDEX IF NOT EXISTS idx_user_names_nicklower ON user_names(nickname_lower)').run();
+  } catch {
+    // index already exists
   }
   try {
     await db.prepare('CREATE INDEX IF NOT EXISTS idx_user_names_nicklower ON user_names(nickname_lower)').run();
