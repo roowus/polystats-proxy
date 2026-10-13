@@ -290,7 +290,7 @@ async function ensureSchema(db: D1Database): Promise<void> {
     } catch (e) {
       const msg = String(e);
       if (/already exists/i.test(msg)) continue;
-      throw new Error(`ensureSchema statement ${i} failed: ${msg} [sql: ${ddl[i].toSQL?.().sql ?? 'n/a'}]`);
+      throw new Error(`ensureSchema statement ${i} failed: ${msg}`);
     }
   }
   // One-time fold: legacy catalog rows -> users.save_count, then drop the old table.
