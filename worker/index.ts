@@ -57,11 +57,21 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-/** WR watch: cheap — only writes when a record actually falls. */
+/** WR watch: cheap — writes only when a record actually falls. Chunked to respect subrequest limits. */
 async function wrWatch(db: D1Database): Promise<void> {
   await ensureSchema(db);
+  const CHUNK = 45; // free plan: max 50 subrequests per invocation
+  const watchCursor = await db
+    .prepare("SELECT value FROM meta WHERE key = 'watch_cursor'")
+    .first<{ value: string }>();
+  let offset = watchCursor ? Number(watchCursor.value) ?? 0 : 0;
   let broken = 0;
-  for (const [, trackId] of ALL_TRACK_IDS) {
+  const window: [string, string][] = [];
+  for (let i = 0; i < Math.min(CHUNK, ALL_TRACK_IDS.length); i++) {
+    window.push(ALL_TRACK_IDS[(offset + i) % ALL_TRACK_IDS.length]);
+  }
+  await setWatchCursor(db, (offset + window.length) % ALL_TRACK_IDS.length);
+  for (const [, trackId] of window) {
     try {
       const res = await fetch(
         `https://vps.kodub.com/v6/leaderboard?version=${API_VERSION}&trackId=${trackId}&skip=0&amount=1&onlyVerified=true`,
@@ -92,6 +102,16 @@ async function wrWatch(db: D1Database): Promise<void> {
     .bind(new Date().toISOString())
     .run();
   if (broken > 0) console.log(`WR watch: ${broken} record(s) broken`);
+}
+
+async function setWatchCursor(db: D1Database, value: number): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO meta (key, value) VALUES ('watch_cursor', ?1)
+       ON CONFLICT(key) DO UPDATE SET value = ?1`
+    )
+    .bind(String(value))
+    .run();
 }
 
 /** Full top-50 snapshot of every track + TOTW archive. */
@@ -820,6 +840,15 @@ export default {
         db.prepare('SELECT r.track_id, r.time_ms, r.verified, r.updated_at FROM results r WHERE r.user_id = ?1 ORDER BY r.time_ms ASC').bind(userId).all(),
       ]);
       return jsonResponse({ user, names: names.results, styles: styles.results, personal_bests: pbs.results });
+    }
+
+    // Path-style aliases: /run/watch | /run/tick | /run/snapshot | /run/backfill
+    // (query-string-free, so monitor services accept them without validation fuss)
+    const runAlias = requestUrl.pathname.match(/^\/run\/(watch|tick|snapshot|backfill)$/);
+    if (runAlias) {
+      const aliasUrl = new URL(requestUrl.toString());
+      aliasUrl.searchParams.set('job', runAlias[1]);
+      return handleRun(request, aliasUrl, env);
     }
 
     if (requestUrl.pathname === '/run') {
