@@ -75,7 +75,7 @@ async function wrWatch(db: D1Database): Promise<void> {
       if (best?.t == null || top.frames < best.t) {
         await db
           .prepare(
-            `INSERT OR IGNORE INTO wr_history (track_id, player, time_ms, set_at, recording)
+            `INSERT INTO wr_history (track_id, player, time_ms, set_at, recording)
              VALUES (?1, ?2, ?3, datetime('now'), NULL)`
           )
           .bind(trackId, top.nickname ?? 'unknown', top.frames)
@@ -386,7 +386,7 @@ async function handleHistory(request: Request, url: URL, env: Env): Promise<Resp
     );
     if (rows.length === 0) return jsonResponse({ error: 'no valid rows' }, 400);
     const stmt = db.prepare(
-      `INSERT OR IGNORE INTO wr_history (track_id, player, time_ms, set_at, recording)
+      `INSERT INTO wr_history (track_id, player, time_ms, set_at, recording)
        VALUES (?1, ?2, ?3, ?4, ?5)`
     );
     await db.batch(rows.map((r) => stmt.bind(r.trackId, r.player.slice(0, 80), Math.round(r.timeMs), r.ts, r.recording ?? null)));
