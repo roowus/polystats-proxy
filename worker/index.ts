@@ -41,6 +41,8 @@ interface Env {
   DB?: D1Database;
   /** Optional shared secret for /run (external schedulers). Set via `wrangler secret put`. */
   SCHEDULE_TOKEN?: string;
+  /** R2 bucket holding native car renders, keyed `cars/<carStyle>.png`. */
+  CARS?: R2Bucket;
 }
 
 interface CatalogRow {
@@ -541,6 +543,44 @@ interface HistoryRow {
   recording?: string | null;
 }
 
+/**
+ * Serve a native car render from R2: `/car/<carStyle>.png`.
+ *
+ * Car styles are base64url, so `-` and `_` are legal and the value is used
+ * verbatim as the object key after a strict character check. A miss returns 404
+ * rather than an error so the client falls back to its drawn placeholder, which
+ * is the expected state for any style not rendered yet.
+ */
+async function handleCarImage(request: Request, url: URL, env: Env): Promise<Response> {
+  const name = decodeURIComponent(url.pathname.slice('/car/'.length));
+  const style = name.replace(/\.png$/i, '');
+
+  // Styles are 16-byte base64url payloads: a leading 'A' then url-safe chars.
+  // Reject anything else so a crafted path cannot address other bucket objects.
+  if (!/^[A-Za-z0-9_-]{20,24}$/.test(style)) {
+    return new Response('Not found', { status: 404, headers: CORS_HEADERS });
+  }
+  if (!env.CARS) {
+    return new Response('Not found', { status: 404, headers: CORS_HEADERS });
+  }
+
+  const object = await env.CARS.get(`cars/${style}.png`);
+  if (!object) {
+    return new Response('Not found', { status: 404, headers: CORS_HEADERS });
+  }
+
+  const headers = new Headers(CORS_HEADERS);
+  headers.set('Content-Type', 'image/png');
+  // Renders are deterministic: one style always maps to one image, so this is
+  // safe to cache permanently.
+  headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+  headers.set('ETag', object.httpEtag);
+  if (object.httpEtag && request.headers.get('If-None-Match') === object.httpEtag) {
+    return new Response(null, { status: 304, headers });
+  }
+  return new Response(object.body, { status: 200, headers });
+}
+
 /** WR history endpoints (backed by D1). */
 async function handleHistory(request: Request, url: URL, env: Env): Promise<Response> {
   const db = env.DB;
@@ -1023,6 +1063,9 @@ export default {
     // Player catalog (this worker's own API, not a proxied passthrough).
     if (requestUrl.pathname === '/catalog') {
       return handleCatalog(request, requestUrl, env);
+    }
+    if (requestUrl.pathname.startsWith('/car/')) {
+      return handleCarImage(request, requestUrl, env);
     }
     if (requestUrl.pathname === '/history') {
       return handleHistory(request, requestUrl, env);

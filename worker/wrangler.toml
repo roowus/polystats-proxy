@@ -12,6 +12,16 @@ binding = "DB"
 database_name = "polystats-catalog"
 database_id = "aa05debf-904d-4daa-9ad7-4c2ac9debf88"
 
+# Native PolyTrack car renders, keyed by car style.
+#
+# Rendered offline (Workers cannot run a headless browser) and uploaded by the
+# render workflow in the site repo. Served by the worker at /car/<style>.png so
+# images come off Cloudflare's edge with immutable caching, and so image traffic
+# never spends D1 row reads that the scrapers depend on.
+[[r2_buckets]]
+binding = "CARS"
+bucket_name = "polystats-cars"
+
 # Five cron jobs (free tier max is 5 — fully used):
 #  - */5:      WR watch — chunked 45 tracks/run, full sweep every 2 runs (10 min); writes only on record falls
 #  - 0 */6:    full top-50 snapshot of all 63 tracks + TOTW archive
