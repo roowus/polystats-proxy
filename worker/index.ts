@@ -205,6 +205,25 @@ async function ensureSchema(env: Env): Promise<void> {
   } catch {
     // column already exists
   }
+  try {
+    await env.DB.prepare('ALTER TABLE users ADD COLUMN save_count INTEGER NOT NULL DEFAULT 0').run();
+  } catch {
+    // column already exists
+  }
+  // One-time fold: legacy catalog rows -> users.save_count, then drop the old table.
+  const folded = await env.DB.prepare("SELECT value FROM meta WHERE key = 'catalog_folded'").first<{ value: string }>();
+  if (!folded) {
+    await env.DB
+      .prepare(
+        `INSERT INTO users (user_id, save_count) SELECT user_id, saved_count FROM catalog
+         ON CONFLICT(user_id) DO UPDATE SET save_count = MAX(users.save_count, excluded.save_count)`
+      )
+      .run();
+    await env.DB.prepare('DROP TABLE IF EXISTS catalog').run();
+    await env.DB
+      .prepare("INSERT INTO meta (key, value) VALUES ('catalog_folded', '1') ON CONFLICT(key) DO UPDATE SET value = '1'")
+      .run();
+  }
   schemaReady = true;
 }
 
@@ -276,7 +295,8 @@ async function handleHistory(request: Request, url: URL, env: Env): Promise<Resp
 }
 
 /** Official track ids (0.6.3) — kept in sync with PolyStats src/lib/tracks.ts. */
-const OFFICIAL_TRACK_IDS: [string, string][] = [
+const ALL_TRACK_IDS: [string, string][] = [
+  // --- community tracks (featured in-game) ---
   ['Summer 1', '5803f9e963625804e3de3246d043dc7dde847aa32e991f7f7326b0453f1fa038'],
   ['Summer 2', '7eac4fee1111152cfba4d3737410264ca0f22c7f5a2211e79f0099589b8b48c0'],
   ['Summer 3', '148826aa16ffaa23dbc453b32cff05e025ddbce1773fc7733cc13d218926515a'],
@@ -294,6 +314,50 @@ const OFFICIAL_TRACK_IDS: [string, string][] = [
   ['Desert 3', '2806030c503abb41a1a26fa9a570888be14296172bb273798ef0ad87a108a2ec'],
   ['Desert 4', '4697ea67b18c3f49b30a3d8884602115536650bc5435c88e3732e64d21a72d33'],
   ['Desert 5', 'e5d084e06db4ab71196fea44efeceb23c8561266a78669c324a38f92581fe2db'],
+  ['Amberbound', '4058e3616fbd79b848e70037adde4f12b4413011050aaf1c9d875cdbe2e33d68'],
+  ['Star Bound', '76e1920a3ca015033a0b21156848def2c248c95d97ccf4aab2312a0302beefe0'],
+  ['Arx Lucida', '520c4f511821ced30b99bceafbb02e6b7531e867126b0756e68d5e157691ef2f'],
+  ['Koselig', '315c9e95c567cce4feca78f5ad6e8d08d0a22dac0d56061af567b43eea3d4fa8'],
+  ['Sky Bound', 'a8913b96daceb5b615fe45aad2bb104e04eb7db140242934657111e1d1f55b89'],
+  ['ShardMir', '66f43b2d2a17f3cee05a127040ca409795058510bd3d1ac7eee224512ec532f5'],
+  ['Sunken Glyphs', 'b3889905b6df31cbe302e58e975988385607771605bf6e8e8e8e31b3d2dc8aa1'],
+  ['Grimspyre', '3cd94552b12fb3a8ac45ca3a5e21a882b71b31c788989b396ab382afc69414ac'],
+  ['Magenta Mines', '3125a5f98c3b43cf1e2604e25e8504bffd714ea5843200fa8ddf0b4c58842f16'],
+  ['Cruising Altitude', 'a2137c20c03ad1848098b47f70417cc0b0bf169010c825dc6fb82f37066808a0'],
+  ['Termite Terror', 'd03b9f7c10c95f40eed389458be51bdf2437febd5673d028da134e59e503c10b'],
+  ['Lost at sea', 'a1f41dc9e884d5d4b1b6025158d70f0934dc4d892076e6c4b32dc3f3846b882e'],
+  ['Frosted Fjords', 'b430aad5e481caa4588e30f46352b876b62f1ba0cf7730a15efd026c91a8f32e'],
+  ['Levitation', '95d8f7cbe11053dbdfaeeb2f3c3d8f53f0d45fb6abeb411a74949a4cf52f427f'],
+  ['Frozen Ramparts', '409f26b9faf55bd0ad748177bf85ebdcfc0ddd572190e7f464f38b4a60587b7e'],
+  ['Tangled Cliffs', 'c1a2c5aef1029d7bbf946f08cd087dd25bad6e019a41694a48a0024c27627dc8'],
+  ['Sludge Pipe Circuit', '9e53d03f4efe86834c49ce202b528d769d9aa7a6e17732d0fc56440463956a1b'],
+  ['Zealot', 'b77ec520a40c4b38d3d7d653b747b1f8627c98709096568db22cd1bfec534ba6'],
+  ['Shrouded Oasis', '9f827673c4132828009237a03e12ead73eae87504b4708a79c6cc0858212262d'],
+  ['Cogware', '9acd9aef650c4ccc41bb01f72ed44dfaa13f2e4404d2e3466f09cc1adcd9a9c0'],
+  ['Land of the Rising Sun', '62d9989187e4508f7866e7b30aa187ddbee2595df21ff5988d7fec3589f9048d'],
+  ['Midas Metropolis', 'b36162623435dc90a54f57590d2baa9f2d67a51cb12c393531f4b6d5e5528ebf'],
+  ['Frozen In Time', '74ae56c0f278a19f3b69f3903198c7b9de09981133205856b53bf6bdf8db4211'],
+  ['Winterfell', '9f4597449906aa0c2baf9a4737406385c829533e64e9e972b25b4189f4593a54'],
+  ['Launch Control', '28b658c7d10eb8b5de6f465e034e87e40f70b37e4534d8c37d1f2af06b5a36d7'],
+  ['Ghost City', '18b69f54f119cfb2867abded9a1574f0799a750ef94aa744d9ec8ef6b4d565ae'],
+  ['MOS ESPA', '5ea46b3ae268a0196dcc59dabe88926400b56e29814658bfed06a284f837cefd'],
+  ['Joenail Jones', 'ab8e1c13ddf394102be1cb04adcff8411127f1e7140a216d27a94fc19b7d0428'],
+  ['Anubis', '86335d78d1a06d3dc81d80f84b8ac2e8f6359e9a206826e2c36f7d3f4351bea4'],
+  ['Natsujō', 'a510bbd3341f2992a12db8a3780cb8943b6087538345d58d16602d6129742df0'],
+  ['Arabica', '8cf99166f12cbb56a9df4e022a0e9b8c78973adb929dbf1e265ebb9f99f01163'],
+  ['Hyperion's Sanctuary', '33d99aad2ad5cef45b1d3afb8735c5229cfd98ac7cc24916e0da7283f7a545ce'],
+  ['Winter Hollow', '5c00f2c90bcf8230183484225d1a417e45b0ad310379acfafd4c8f1dc7345dd7'],
+  ['Clay temples', '009fad7fcc215022c6b2dbb2b6de622f07cd88d4930b8e2b6a6b74c1f5de9e44'],
+  ['Las Calles', '1ad53694ee3e96aea27afa7b64d5c29d115de88a17b69cf3fe3f5609c52b040b'],
+  ['DESERT STALLION', '2ed125037366052871fbb97da6e1bda49cfeb471f6b9c8fa799d520bdb3683e2'],
+  ['Last Remnant', 'f79b1d863d50f9e3b4489988698065c6d775ff3ec90bf91085bad05ad5ec8316'],
+  ['lu muvimento', '27429a1d1bf05770851e3919af70f47c6cd7a269c67032b084fb4345f6c271ce'],
+  ['90*RESET', 'f5c327cf09b90e4de8c3c1f9c910dbb7988cf15485d2e4beec3cc03aef408c5c'],
+  ['Opal Palace Repolished', '7451c2128cb96bc28195cf0ca0f83a46c3b55d78d434232d9de085dd1cf0ab36'],
+  ['Sandline Ultimatum', '089f2aebcfe4f24d8dda3a8a630172d2bd13793e78c5247adfaa760743a377e1'],
+  ['Malformations', '5e40f730509204c77e9c610839ed43addddbe0f8aa007168447f7fde38583905'],
+  ['Snow Park', '191737cc4d1b74949e992d99371e5c7f5fc446a716af571c6e5449b23e9f4558'],
+  ['concrete jungle', '39bd3fa6c3c769b298c219aee7561af35a6d856bfee14b46b0b48499e7a57ed5'],
 ];
 
 const SNAPSHOT_DEPTH = 50; // top N players per track per run (fresh data)
@@ -435,7 +499,7 @@ async function snapshotLeaderboards(env: Env): Promise<void> {
     console.error('TOTW archive failed:', e);
   }
 
-  for (const [trackName, trackId] of OFFICIAL_TRACK_IDS) {
+  for (const [trackName, trackId] of ALL_TRACK_IDS) {
     try {
       const res = await fetch(
         `https://vps.kodub.com/v6/leaderboard?version=${API_VERSION}&trackId=${trackId}&skip=0&amount=${SNAPSHOT_DEPTH}&onlyVerified=false`,
@@ -497,9 +561,10 @@ async function handleCatalog(request: Request, url: URL, env: Env): Promise<Resp
   await ensureSchema(env);
 
   if (request.method === 'GET') {
+    await ensureSchema(env);
     const limit = Math.min(Number(url.searchParams.get('limit') ?? 50) || 50, 100);
     const { results } = await env.DB
-      .prepare('SELECT user_id, nickname, saved_count, last_seen FROM catalog ORDER BY saved_count DESC, last_seen DESC LIMIT ?')
+      .prepare('SELECT user_id, nickname, save_count AS saved_count, last_seen FROM users WHERE save_count > 0 ORDER BY save_count DESC, last_seen DESC LIMIT ?')
       .bind(limit)
       .all<CatalogRow>();
     return jsonResponse({ users: results });
@@ -534,10 +599,10 @@ async function handleCatalog(request: Request, url: URL, env: Env): Promise<Resp
     if (!userId || !/^[a-f0-9]{64}$/.test(userId)) {
       return jsonResponse({ error: 'userId query param must be 64-char hex' }, 400);
     }
-    await env.DB.batch([
-      env.DB.prepare('DELETE FROM catalog WHERE user_id = ?1').bind(userId),
-      env.DB.prepare('DELETE FROM users WHERE user_id = ?1').bind(userId),
-    ]);
+    await env.DB
+      .prepare('UPDATE users SET save_count = 0 WHERE user_id = ?1')
+      .bind(userId)
+      .run();
     return jsonResponse({ ok: true });
   }
 
@@ -560,10 +625,10 @@ async function handleCatalog(request: Request, url: URL, env: Env): Promise<Resp
     const nickname = typeof body.nickname === 'string' ? body.nickname.slice(0, 50) : null;
     await env.DB
       .prepare(
-        `INSERT INTO catalog (user_id, nickname, saved_count, last_seen)
+        `INSERT INTO users (user_id, nickname, save_count, last_seen)
          VALUES (?1, ?2, 1, datetime('now'))
          ON CONFLICT(user_id) DO UPDATE SET
-           saved_count = saved_count + 1,
+           save_count = save_count + 1,
            nickname = COALESCE(?2, nickname),
            last_seen = datetime('now')`
       )
@@ -581,14 +646,41 @@ export default {
       (async () => {
         if (!env.DB) return;
         await ensureSchema(env);
-        // Hourly cron: freshness — snapshot top-50 of every track.
-        await snapshotLeaderboards(env);
-        await env.DB
-          .prepare("INSERT INTO meta (key, value) VALUES ('last_fresh_run', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1")
-          .bind(new Date().toISOString())
-          .run();
-        // 6-hourly cron: backfill — deep-crawl the long tail.
-        if (controller.cron === '0 */6 * * *') {
+        if (controller.cron === '*/15 * * * *') {
+          // WR watch: cheap — only writes when a record actually falls.
+          let broken = 0;
+          for (const [, trackId] of ALL_TRACK_IDS) {
+            try {
+              const res = await fetch(
+                `https://vps.kodub.com/v6/leaderboard?version=${API_VERSION}&trackId=${trackId}&skip=0&amount=1&onlyVerified=true`,
+                { headers: { Origin: GAME_ORIGIN } }
+              );
+              if (!res.ok) continue;
+              const data = (await res.json()) as { entries?: { userId: string; nickname?: string; frames?: number }[] };
+              const top = data.entries?.[0];
+              if (!top?.frames) continue;
+              const best = await env.DB.prepare('SELECT MIN(time_ms) AS t FROM wr_history WHERE track_id = ?1').bind(trackId).first<{ t: number | null }>();
+              if (best?.t == null || top.frames < best.t) {
+                await env.DB
+                  .prepare(
+                    `INSERT OR IGNORE INTO wr_history (track_id, player, time_ms, set_at, recording)
+                     VALUES (?1, ?2, ?3, datetime('now'), NULL)`
+                  )
+                  .bind(trackId, top.nickname ?? 'unknown', top.frames)
+                  .run();
+                broken += 1;
+              }
+            } catch (e) {
+              console.error('WR watch failed for', trackId, e);
+            }
+          }
+          await env.DB
+            .prepare("INSERT INTO meta (key, value) VALUES ('last_wr_watch', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1")
+            .bind(new Date().toISOString())
+            .run();
+          if (broken > 0) console.log(`WR watch: ${broken} record(s) broken`);
+        } else if (controller.cron === '0 6 * * *') {
+          // Daily backfill: deep-crawl the long tail.
           const cursor = await getCursor(env);
           const seen = await backfillTracks(env, cursor);
           await env.DB
@@ -596,6 +688,13 @@ export default {
             .bind(new Date().toISOString())
             .run();
           console.log(`backfill pass done: cursor ${cursor}, ${seen} results seen`);
+        } else {
+          // 6-hourly full snapshot: top-50 of every track + TOTW archive.
+          await snapshotLeaderboards(env);
+          await env.DB
+            .prepare("INSERT INTO meta (key, value) VALUES ('last_fresh_run', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1")
+            .bind(new Date().toISOString())
+            .run();
         }
       })()
     );
