@@ -576,14 +576,27 @@ async function handleCatalog(request: Request, url: URL, env: Env): Promise<Resp
 }
 
 export default {
-  async scheduled(_controller: unknown, env: Env, ctx: { waitUntil: (p: Promise<unknown>) => void }) {
+  async scheduled(controller: { cron: string }, env: Env, ctx: { waitUntil: (p: Promise<unknown>) => void }) {
     ctx.waitUntil(
       (async () => {
-        await snapshotLeaderboards(env);
         if (!env.DB) return;
-        const cursor = await getCursor(env);
-        const seen = await backfillTracks(env, cursor);
-        console.log(`backfill pass done: cursor ${cursor}, ${seen} results seen`);
+        await ensureSchema(env);
+        // Hourly cron: freshness — snapshot top-50 of every track.
+        await snapshotLeaderboards(env);
+        await env.DB
+          .prepare("INSERT INTO meta (key, value) VALUES ('last_fresh_run', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1")
+          .bind(new Date().toISOString())
+          .run();
+        // 6-hourly cron: backfill — deep-crawl the long tail.
+        if (controller.cron === '0 */6 * * *') {
+          const cursor = await getCursor(env);
+          const seen = await backfillTracks(env, cursor);
+          await env.DB
+            .prepare("INSERT INTO meta (key, value) VALUES ('last_backfill_run', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1")
+            .bind(new Date().toISOString())
+            .run();
+          console.log(`backfill pass done: cursor ${cursor}, ${seen} results seen`);
+        }
       })()
     );
   },
@@ -617,6 +630,14 @@ export default {
         env.DB.prepare('SELECT r.track_id, r.time_ms, r.verified, r.updated_at FROM results r WHERE r.user_id = ?1 ORDER BY r.time_ms ASC').bind(userId).all(),
       ]);
       return jsonResponse({ user, names: names.results, styles: styles.results, personal_bests: pbs.results });
+    }
+
+    if (requestUrl.pathname === '/status') {
+      if (request.method !== 'GET') return jsonResponse({ error: 'method not allowed' }, 405);
+      if (!env.DB) return jsonResponse({ error: 'status unavailable: D1 binding missing' }, 503);
+      const { results } = await env.DB.prepare('SELECT key, value FROM meta').all<{ key: string; value: string }>();
+      const meta = Object.fromEntries(results.map((r) => [r.key, r.value]));
+      return jsonResponse({ last_fresh_run: meta.last_fresh_run ?? null, last_backfill_run: meta.last_backfill_run ?? null });
     }
 
     if (requestUrl.pathname === '/users') {
