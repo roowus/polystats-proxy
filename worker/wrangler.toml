@@ -15,8 +15,8 @@ database_id = "aa05debf-904d-4daa-9ad7-4c2ac9debf88"
 # Five cron jobs (free tier max is 5 — fully used):
 #  - */5:      WR watch — chunked 45 tracks/run, full sweep every 2 runs (10 min); writes only on record falls
 #  - 0 */6:    full top-50 snapshot of all 63 tracks + TOTW archive
-#  - 0 12/18:  backfill x2/day — 6 tracks x 750 players = ~9k players/day
+#  - 0 3/15:   backfill x2/day — 6 tracks x 750 players = ~9k players/day
 #  + UptimeRobot 5-min /run?job=tick adds ~14.4k players/day
 # Budget: ~77k D1 writes/day of the 100k/day free allowance.
 [triggers]
-crons = ["*/5 * * * *", "0 */6 * * *", "0 12 * * *", "0 18 * * *"]
+crons = ["*/5 * * * *", "0 */6 * * *", "0 3 * * *", "0 15 * * *"]

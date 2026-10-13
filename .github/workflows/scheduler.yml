@@ -7,8 +7,7 @@ on:
   schedule:
     - cron: "*/15 * * * *" # WR watch (worker skips if it ran recently)
     - cron: "0 */6 * * *"  # full snapshot (redundancy — CF primary)
-    - cron: "0 2 * * *"    # backfill #2 (off-peak, no CF collision)
-    - cron: "0 23 * * *"   # backfill #3 (off-peak, no CF collision)
+    - cron: "0 2 * * *"    # backfill (off-peak, no CF collision)
   workflow_dispatch:        # manual trigger
     inputs:
       job:
