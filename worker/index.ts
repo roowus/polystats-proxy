@@ -932,6 +932,20 @@ export default {
       return jsonResponse({ user, names: names.results, styles: styles.results, personal_bests: pbs.results });
     }
 
+    // Game bundle pass-through: lets the site parse the live track catalog
+    // client-side (PolyTrack assets have no CORS headers of their own).
+    if (requestUrl.pathname === '/polytrack-bundle') {
+      if (request.method !== 'GET') return new Response('Method not allowed', { status: 405, headers: CORS_HEADERS });
+      const pageRes = await fetch('https://www.kodub.com/apps/polytrack');
+      const html = await pageRes.text();
+      const versionMatch = html.match(/app-polytrack\.kodub\.com\/([\d.]+)/);
+      const version = versionMatch ? versionMatch[1] : '0.6.3';
+      const bundle = await fetch(`https://app-polytrack.kodub.com/${version}/main.bundle.js`);
+      const headers = new Headers({ ...CORS_HEADERS, 'Content-Type': 'application/javascript' });
+      headers.set('Cache-Control', 'public, max-age=3600');
+      return new Response(bundle.body, { status: bundle.status, headers });
+    }
+
     // Path-style aliases: /run/watch | /run/tick | /run/snapshot | /run/backfill
     // (query-string-free, so monitor services accept them without validation fuss)
     const runAlias = requestUrl.pathname.match(/^\/run\/(watch|tick|snapshot|backfill)$/);
