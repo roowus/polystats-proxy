@@ -59,17 +59,95 @@ function jsonResponse(body: unknown, status = 200): Response {
 let schemaReady = false;
 async function ensureSchema(env: Env): Promise<void> {
   if (schemaReady) return;
-  await env.DB
-    .prepare(
+  await env.DB.batch([
+    env.DB.prepare(
       `CREATE TABLE IF NOT EXISTS catalog (
         user_id TEXT PRIMARY KEY,
         nickname TEXT,
         saved_count INTEGER NOT NULL DEFAULT 1,
         last_seen TEXT NOT NULL
       )`
-    )
-    .run();
+    ),
+    env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS wr_history (
+        track_id TEXT NOT NULL,
+        player TEXT NOT NULL,
+        time_ms INTEGER NOT NULL,
+        set_at TEXT NOT NULL,
+        recording TEXT,
+        UNIQUE(track_id, player, time_ms, set_at)
+      )`
+    ),
+    env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_history_track ON wr_history(track_id, time_ms)'),
+  ]);
   schemaReady = true;
+}
+
+interface HistoryRow {
+  track_id: string;
+  player: string;
+  time_ms: number;
+  set_at: string;
+  recording?: string | null;
+}
+
+/** WR history endpoints (backed by D1). */
+async function handleHistory(request: Request, url: URL, env: Env): Promise<Response> {
+  if (!env.DB) {
+    return jsonResponse({ error: 'history unavailable: D1 binding missing' }, 503);
+  }
+  await ensureSchema(env);
+
+  if (request.method === 'GET') {
+    const trackId = url.searchParams.get('trackId');
+    if (trackId) {
+      const { results } = await env.DB
+        .prepare('SELECT track_id, player, time_ms, set_at, recording FROM wr_history WHERE track_id = ?1 ORDER BY set_at ASC')
+        .bind(trackId)
+        .all<HistoryRow>();
+      return jsonResponse({ history: results });
+    }
+    const { results } = await env.DB
+      .prepare(
+        `SELECT h.track_id, h.player, h.time_ms, h.set_at
+         FROM wr_history h
+         JOIN (SELECT track_id, MIN(time_ms) AS best FROM wr_history GROUP BY track_id) b
+           ON b.track_id = h.track_id AND b.best = h.time_ms
+         ORDER BY h.track_id`
+      )
+      .all<HistoryRow>();
+    return jsonResponse({ current_records: results });
+  }
+
+  if (request.method === 'POST') {
+    const origin = request.headers.get('Origin') ?? '';
+    if (!WRITE_ORIGINS.has(origin)) {
+      return jsonResponse({ error: 'writes from this origin are not allowed' }, 403);
+    }
+    let body: { rows?: { trackId?: string; player?: string; timeMs?: number; ts?: string; recording?: string }[] };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return jsonResponse({ error: 'invalid JSON body' }, 400);
+    }
+    const rows = (body.rows ?? []).filter(
+      (r) =>
+        r.trackId &&
+        /^[a-f0-9]{64}$/.test(r.trackId) &&
+        typeof r.player === 'string' &&
+        typeof r.timeMs === 'number' &&
+        typeof r.ts === 'string'
+    );
+    if (rows.length === 0) return jsonResponse({ error: 'no valid rows' }, 400);
+    const stmt = env.DB.prepare(
+      `INSERT OR IGNORE INTO wr_history (track_id, player, time_ms, set_at, recording)
+       VALUES (?1, ?2, ?3, ?4, ?5)`
+    );
+    await env.DB.batch(rows.map((r) => stmt.bind(r.trackId, r.player.slice(0, 80), Math.round(r.timeMs), r.ts, r.recording ?? null)));
+    return jsonResponse({ ok: true, ingested: rows.length });
+  }
+
+  return jsonResponse({ error: 'method not allowed' }, 405);
 }
 
 /** Player catalog endpoints (backed by D1; 503 when the binding is absent). */
@@ -146,8 +224,10 @@ export default {
 
     // Player catalog (this worker's own API, not a proxied passthrough).
     if (requestUrl.pathname === '/catalog') {
-      const res = await handleCatalog(request, requestUrl, env);
-      return res;
+      return handleCatalog(request, requestUrl, env);
+    }
+    if (requestUrl.pathname === '/history') {
+      return handleHistory(request, requestUrl, env);
     }
 
     if (request.method !== 'GET') {
