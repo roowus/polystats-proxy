@@ -146,7 +146,7 @@ async function handleRun(request: Request, url: URL, env: Env): Promise<Response
     else if (job === 'snapshot') await runSnapshot(db);
     else await runBackfill(db);
   } catch (e) {
-    return jsonResponse({ error: String(e) }, 500);
+    return jsonResponse({ error: String(e), stack: e instanceof Error ? e.stack : null }, 500);
   }
   await db
     .prepare("INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2")
