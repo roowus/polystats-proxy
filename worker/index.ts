@@ -449,7 +449,7 @@ const ALL_TRACK_IDS: [string, string][] = [
 
 const SNAPSHOT_DEPTH = 50; // top N players per track per run (fresh data)
 const BACKFILL_TRACKS_PER_RUN = 6; // rotating window: full sweep every ~3 runs
-const BACKFILL_PAGES = 10; // pages of 50 -> 500 extra players per backfilled track
+const BACKFILL_PAGES = 15; // pages of 50 -> 750 extra players per backfilled track
 const API_VERSION = '0.6.3';
 
 async function getCursor(db: D1Database): Promise<number> {
@@ -737,7 +737,7 @@ export default {
         await ensureSchema(db);
         if (controller.cron === '*/15 * * * *') {
           await wrWatch(db);
-        } else if (controller.cron === '0 6 * * *') {
+        } else if (controller.cron === '0 6 * * *' || controller.cron === '0 12 * * *' || controller.cron === '0 18 * * *') {
           await runBackfill(db);
         } else {
           await runSnapshot(db);
