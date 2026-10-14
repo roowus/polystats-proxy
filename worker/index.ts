@@ -198,6 +198,30 @@ async function backfillTick(db: D1Database): Promise<{ trackName: string; page: 
  * Guarded by SCHEDULE_TOKEN and a minimum-interval so double-fires and
  * strangers can't burn the D1 write budget.
  */
+/**
+ * Refresh the cached row counts shown by /status.
+ *
+ * COUNT(*) visits every row, so this only runs after a job that actually
+ * changed the data, never on a user-facing request.
+ */
+async function recordCounts(db: D1Database): Promise<void> {
+  const counts = await db.batch([
+    db.prepare('SELECT COUNT(*) AS n FROM users'),
+    db.prepare('SELECT COUNT(*) AS n FROM results'),
+    db.prepare('SELECT COUNT(*) AS n FROM wr_history'),
+    db.prepare('SELECT COUNT(*) AS n FROM snapshots'),
+    db.prepare('SELECT COUNT(*) AS n FROM totw_archive'),
+  ]);
+  const n = (i: number) => (counts[i].results[0] as { n: number }).n;
+  await db.batch([
+    db.prepare("INSERT INTO meta (key, value) VALUES ('count_users', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1").bind(String(n(0))),
+    db.prepare("INSERT INTO meta (key, value) VALUES ('count_results', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1").bind(String(n(1))),
+    db.prepare("INSERT INTO meta (key, value) VALUES ('count_wr_history', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1").bind(String(n(2))),
+    db.prepare("INSERT INTO meta (key, value) VALUES ('count_snapshots', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1").bind(String(n(3))),
+    db.prepare("INSERT INTO meta (key, value) VALUES ('count_totw_archive', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1").bind(String(n(4))),
+  ]);
+}
+
 async function handleRun(request: Request, url: URL, env: Env): Promise<Response> {
   if (!env.DB) return jsonResponse({ error: 'jobs unavailable: D1 binding missing' }, 503);
   const db = env.DB;
@@ -230,6 +254,9 @@ async function handleRun(request: Request, url: URL, env: Env): Promise<Response
     .prepare("INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2")
     .bind(key, new Date().toISOString())
     .run();
+  // Jobs are the only thing that changes row counts, so refresh the cached
+  // values here rather than making every /status call count rows.
+  await recordCounts(db).catch(() => {});
   return jsonResponse({ ok: true, job });
 }
 
@@ -493,7 +520,9 @@ async function ensureSchema(db: D1Database): Promise<void> {
       end_time TEXT,
       first_seen TEXT NOT NULL DEFAULT (datetime('now'))
     )`),
-    db.prepare('CREATE INDEX IF NOT EXISTS idx_users_nickname ON users(nickname)'),
+    // Indexed with COLLATE NOCASE: the search filters nickname_lower with LIKE,
+    // and SQLite can only use an index for LIKE when the collation matches.
+    db.prepare('CREATE INDEX IF NOT EXISTS idx_users_nicklower_nocase ON users(nickname_lower COLLATE NOCASE)'),
     db.prepare('CREATE INDEX IF NOT EXISTS idx_snapshots_user ON snapshots(user_id)'),
   ];
   for (let i = 0; i < ddl.length; i++) {
@@ -517,17 +546,30 @@ async function ensureSchema(db: D1Database): Promise<void> {
     }
   }
   // Backfill lowercase values for rows migrated before the column existed.
-  await db.prepare("UPDATE users SET nickname_lower = lower(nickname) WHERE nickname_lower IS NULL AND nickname IS NOT NULL").run();
-  await db.prepare("UPDATE user_names SET nickname_lower = lower(nickname) WHERE nickname_lower IS NULL AND nickname IS NOT NULL").run();
+  //
+  // Gated on a meta flag rather than run unconditionally: the UPDATE has to
+  // inspect every row to find the ones needing work, so on a cold start it cost
+  // a full table scan even once it had nothing left to do. Workers recycle
+  // isolates often, which turned a one-time migration into a recurring cost.
+  const lowerBackfilled = await db
+    .prepare("SELECT value FROM meta WHERE key = 'nicklower_backfilled'")
+    .first<{ value: string }>();
+  if (!lowerBackfilled) {
+    await db.prepare("UPDATE users SET nickname_lower = lower(nickname) WHERE nickname_lower IS NULL AND nickname IS NOT NULL").run();
+    await db.prepare("UPDATE user_names SET nickname_lower = lower(nickname) WHERE nickname_lower IS NULL AND nickname IS NOT NULL").run();
+    await db
+      .prepare("INSERT INTO meta (key, value) VALUES ('nicklower_backfilled', '1') ON CONFLICT(key) DO UPDATE SET value = '1'")
+      .run();
+  }
 
   // Indexes on migrated columns go AFTER the columns exist.
   try {
-    await db.prepare('CREATE INDEX IF NOT EXISTS idx_user_names_nicklower ON user_names(nickname_lower)').run();
+    await db.prepare('CREATE INDEX IF NOT EXISTS idx_user_names_nicklower ON user_names(nickname_lower COLLATE NOCASE)').run();
   } catch {
     // index already exists
   }
   try {
-    await db.prepare('CREATE INDEX IF NOT EXISTS idx_user_names_nicklower ON user_names(nickname_lower)').run();
+    await db.prepare('CREATE INDEX IF NOT EXISTS idx_user_names_nicklower ON user_names(nickname_lower COLLATE NOCASE)').run();
   } catch {
     // index already exists
   }
@@ -1186,23 +1228,26 @@ export default {
     if (requestUrl.pathname === '/status') {
       if (request.method !== 'GET') return jsonResponse({ error: 'method not allowed' }, 405);
       if (!env.DB) return jsonResponse({ error: 'status unavailable: D1 binding missing' }, 503);
+      // Serve counts from meta, not COUNT(*).
+      //
+      // COUNT(*) has to visit every row: across these five tables that was
+      // ~25k row reads per call, and the site calls this on every page load, so
+      // roughly 200 page views could spend the whole daily allowance and stop
+      // the scrapers. The counts are written by the jobs that change them
+      // (see recordCounts), so this is a single indexed read.
       const { results } = await env.DB.prepare('SELECT key, value FROM meta').all<{ key: string; value: string }>();
       const meta = Object.fromEntries(results.map((r) => [r.key, r.value]));
-      const counts = await env.DB.batch([
-        env.DB.prepare('SELECT COUNT(*) AS n FROM users'),
-        env.DB.prepare('SELECT COUNT(*) AS n FROM results'),
-        env.DB.prepare('SELECT COUNT(*) AS n FROM wr_history'),
-        env.DB.prepare('SELECT COUNT(*) AS n FROM snapshots'),
-        env.DB.prepare('SELECT COUNT(*) AS n FROM totw_archive'),
-      ]);
-      const n = (i: number) => (counts[i].results[0] as { n: number }).n;
+      const num = (k: string) => {
+        const v = Number(meta[k]);
+        return Number.isFinite(v) ? v : 0;
+      };
       return jsonResponse({
         version: 4,
-        users: n(0),
-        results: n(1),
-        wr_history: n(2),
-        snapshots: n(3),
-        totw_archive: n(4),
+        users: num('count_users'),
+        results: num('count_results'),
+        wr_history: num('count_wr_history'),
+        snapshots: num('count_snapshots'),
+        totw_archive: num('count_totw_archive'),
         last_fresh_run: meta.last_fresh_run ?? null,
         last_backfill_run: meta.last_backfill_run ?? null,
         last_wr_watch: meta.last_wr_watch ?? null,
