@@ -367,11 +367,29 @@ export function buildFtsQuery(term: string): string {
  *
  * Isolate-local and best-effort by design: a rough brake, not a hard quota.
  */
-const SCAN_BUDGET_PER_ISOLATE = 200;
-let scansUsed = 0;
-let scanWindowDay = new Date().toISOString().slice(0, 10);
+export const SCAN_BUDGET_PER_ISOLATE = 25;
+export let scansUsed = 0;
+export let scanWindowDay = new Date().toISOString().slice(0, 10);
 
-function mayRunExpensiveScan(): boolean {
+/** Minimum term length before a substring scan is allowed. */
+export const MIN_SCAN_LENGTH = 4;
+
+/**
+ * Whether a substring scan is allowed for this term.
+ *
+ * Two independent gates, both there to protect the shared read budget:
+ *   - the term must be long enough to be a deliberate fragment. Short prefixes
+ *     are the most-retyped input and are served by the indexed FTS path, so
+ *     letting them scan would spend the budget on the cheapest-to-avoid case.
+ *   - the per-isolate scan budget must not be spent. Returning no results is
+ *     preferable to starving the scrapers, which share the database.
+ */
+export function mayScanFor(term: string): boolean {
+  if (term.length < MIN_SCAN_LENGTH) return false;
+  return mayRunExpensiveScan();
+}
+
+export function mayRunExpensiveScan(): boolean {
   const today = new Date().toISOString().slice(0, 10);
   if (today !== scanWindowDay) {
     scanWindowDay = today;
@@ -380,6 +398,12 @@ function mayRunExpensiveScan(): boolean {
   if (scansUsed >= SCAN_BUDGET_PER_ISOLATE) return false;
   scansUsed++;
   return true;
+}
+
+/** Reset rationing state. Exported for tests, which must not share module state. */
+export function resetScanBudget(day?: string): void {
+  scansUsed = 0;
+  scanWindowDay = day ?? new Date().toISOString().slice(0, 10);
 }
 
 async function searchUsers(
@@ -429,12 +453,7 @@ async function searchUsers(
   //     character (the common case, and the one a user retypes most)
   //   - skipped entirely when FTS is working and simply found nothing short,
   //     unless the term is long enough to be worth the scan
-  const MIN_SCAN_LENGTH = 4;
-  if (lowered.length < MIN_SCAN_LENGTH) {
-    return { results: [] };
-  }
-  if (!mayRunExpensiveScan()) {
-    // Budget spent: prefer returning nothing over starving the collectors.
+  if (!mayScanFor(lowered)) {
     return { results: [] };
   }
 
