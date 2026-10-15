@@ -367,12 +367,23 @@ export function buildFtsQuery(term: string): string {
  *
  * Isolate-local and best-effort by design: a rough brake, not a hard quota.
  */
-export const SCAN_BUDGET_PER_ISOLATE = 25;
-export let scansUsed = 0;
-export let scanWindowDay = new Date().toISOString().slice(0, 10);
+/**
+ * Cap on expensive full-scan searches per isolate.
+ *
+ * Search and the scrapers share one database and one daily row-read allowance,
+ * and a burst of short-fragment searches spent it and took data collection down
+ * with it. Past the cap, search keeps working on the FTS prefix index and simply
+ * returns fewer results rather than starving the collectors.
+ *
+ * This is a secondary brake. The primary defence is not doing the scan at all:
+ * the table is indexed, and the substring fallback needs a deliberate fragment.
+ */
+const SCAN_BUDGET_PER_ISOLATE = 8;
+let scansUsed = 0;
+let scanWindowDay = new Date().toISOString().slice(0, 10);
 
 /** Minimum term length before a substring scan is allowed. */
-export const MIN_SCAN_LENGTH = 4;
+const MIN_SCAN_LENGTH = 5;
 
 /**
  * Whether a substring scan is allowed for this term.
@@ -387,6 +398,18 @@ export const MIN_SCAN_LENGTH = 4;
 export function mayScanFor(term: string): boolean {
   if (term.length < MIN_SCAN_LENGTH) return false;
   return mayRunExpensiveScan();
+}
+
+/**
+ * The rationing constants, exposed for tests.
+ *
+ * A plain `export const` cannot be used here: the Workers runtime requires every
+ * module export to be a handler or a function, and rejects the script at startup
+ * with "Incorrect type for map entry". Exporting a function that returns them
+ * keeps the values testable without tripping that check.
+ */
+export function scanBudget(): { perIsolate: number; minLength: number } {
+  return { perIsolate: SCAN_BUDGET_PER_ISOLATE, minLength: MIN_SCAN_LENGTH };
 }
 
 export function mayRunExpensiveScan(): boolean {
@@ -421,6 +444,13 @@ async function searchUsers(
   // and car style onto this row.
   const withRefresh = (results: Record<string, unknown>[]) => ({ results });
 
+  // FTS is a prefix index: it answers "nickname starts with this term", not
+  // "nickname contains it". A miss there is therefore NOT a definitive no, which
+  // is why the substring fallback below still exists.
+  //
+  // `ftsAnswered` records that the index was usable, so a miss can be told apart
+  // from the index being broken.
+  let ftsAnswered = false;
   if (ftsQuery) {
     try {
       const { results } = await db
@@ -434,6 +464,7 @@ async function searchUsers(
         )
         .bind(ftsQuery, limit)
         .all();
+      ftsAnswered = true;
       if (results && results.length > 0) return withRefresh(results);
     } catch (err) {
       // Malformed MATCH or a missing index — fall through to LIKE.
@@ -549,6 +580,13 @@ async function ensureSchema(db: D1Database): Promise<void> {
     // the worker returned 500 until it was fixed. The index is now created after
     // the column, below.
     db.prepare('CREATE INDEX IF NOT EXISTS idx_snapshots_user ON snapshots(user_id)'),
+    // The homepage lists the most-saved players with
+    //   WHERE save_count > 0 ORDER BY save_count DESC, last_seen DESC LIMIT ?
+    // With no index SQLite visits and sorts every row in `users` on each page
+    // load, which is one of the things that exhausted the daily read allowance.
+    // Declared here, after the users table above, for the same reason the
+    // nickname_lower index is created after its ALTER.
+    db.prepare('CREATE INDEX IF NOT EXISTS idx_users_save_count ON users(save_count DESC, last_seen DESC)'),
   ];
   for (let i = 0; i < ddl.length; i++) {
     try {
@@ -1216,6 +1254,35 @@ export default {
       return new Response(null, { status: 204, headers: { ...CORS_HEADERS, ...CORS } });
     }
 
+    // Any unhandled error becomes a described 503 rather than a bare 500.
+    //
+    // A 500 from this worker carries no useful body, and the site rendered that
+    // as "this player hasn't set a time yet" — so a total backend outage was
+    // reported as a player having no records, and the fault looked like it was in
+    // the data rather than here. Reporting the reason keeps that from happening
+    // again, and the daily-quota case in particular is worth naming: it is the
+    // one failure that resolves itself at midnight UTC.
+    try {
+      return await handleRequest(request, env);
+    } catch (err) {
+      const message = String(err);
+      const quota = /exceeded D1's free tier|daily row read limit/i.test(message);
+      console.error('unhandled worker error:', message);
+      return jsonResponse(
+        {
+          error: quota ? 'database read quota exhausted for today' : 'internal error',
+          detail: message.slice(0, 200),
+          retryable: quota,
+        },
+        quota ? 503 : 500
+      );
+    }
+  },
+};
+
+/** Route dispatch, separated so `fetch` can wrap it in a single error handler. */
+async function handleRequest(request: Request, env: Env): Promise<Response> {
+  {
     const requestUrl = new URL(request.url);
 
     // Player catalog (this worker's own API, not a proxied passthrough).
@@ -1287,6 +1354,14 @@ export default {
     if (requestUrl.pathname === '/status') {
       if (request.method !== 'GET') return jsonResponse({ error: 'method not allowed' }, 405);
       if (!env.DB) return jsonResponse({ error: 'status unavailable: D1 binding missing' }, 503);
+      // This route reads `meta` without going through ensureSchema, so on a
+      // database that has never been initialised it queried a missing table and
+      // returned 500 rather than an empty status.
+      try {
+        await ensureSchema(env.DB);
+      } catch (err) {
+        console.error('status: ensureSchema failed:', String(err));
+      }
       // Serve counts from meta, not COUNT(*).
       //
       // COUNT(*) has to visit every row: across these five tables that was
@@ -1370,5 +1445,5 @@ export default {
       status: apiResponse.status,
       headers,
     });
-  },
-};
+  }
+}

@@ -32,24 +32,49 @@ function ensureSchemaBody() {
 
 test('every column an index references is created before that index', () => {
   const body = ensureSchemaBody();
-  // Every `CREATE INDEX ... ON <table>(<column>)` in the function.
+  // Every `CREATE INDEX ... ON <table>(<column>)`, wherever it appears.
   const indexRe = /CREATE INDEX[^`'"]*?ON\s+(\w+)\s*\(\s*(\w+)/gi;
   for (const m of body.matchAll(indexRe)) {
     const [, table, column] = m;
     const indexAt = m.index ?? 0;
-    // The column is available if the table is created with it inline, or an
-    // ALTER TABLE adds it earlier in the function than the index.
-    const inlineCreate = new RegExp(
-      `CREATE TABLE IF NOT EXISTS ${table}\\s*\\([^)]*\\b${column}\\b`,
-      's'
-    ).test(body);
-    const alterAt = body.search(
-      new RegExp(`ALTER TABLE ${table} ADD COLUMN ${column}\\b`)
+    // The column must exist by the time the index runs. Two ways that can be
+    // true, and BOTH must be checked by position, because the failure this test
+    // guards against is purely one of ordering:
+    //   - the CREATE TABLE ... includes the column, and appears before the index
+    //   - an ALTER TABLE adds it before the index
+    //
+    // The table definition is multi-line, so the pattern has to span newlines
+    // (`[\s\S]`); a `[^)]` character class stops at the first `)` in the column
+    // list and silently failed to match, which is how an index on the `users`
+    // table slipped in ahead of the table itself.
+    const tableRe = new RegExp(
+      `CREATE TABLE IF NOT EXISTS ${table}\\s*\\([\\s\\S]*?\\b${column}\\b`,
+      'i'
     );
-    const created = inlineCreate || (alterAt > -1 && alterAt < indexAt);
+    const tableMatch = tableRe.exec(body);
+    const tableAt = tableMatch ? tableMatch.index : -1;
+    const alterAt = body.search(new RegExp(`ALTER TABLE ${table} ADD COLUMN ${column}\\b`));
+
+    const createdBeforeIndex =
+      (tableAt > -1 && tableAt < indexAt) || (alterAt > -1 && alterAt < indexAt);
     assert.ok(
-      created,
-      `index on ${table}(${column}) is created before that column exists`
+      createdBeforeIndex,
+      `index on ${table}(${column}) at offset ${indexAt} is created before that ` +
+        `column exists (table at ${tableAt}, alter at ${alterAt})`
+    );
+  }
+});
+
+test('every CREATE INDEX follows the table it indexes', () => {
+  const body = ensureSchemaBody();
+  const indexRe = /CREATE INDEX[^`'"]*?ON\s+(\w+)\s*\(/gi;
+  for (const m of body.matchAll(indexRe)) {
+    const [, table] = m;
+    const indexAt = m.index ?? 0;
+    const tableAt = body.search(new RegExp(`CREATE TABLE IF NOT EXISTS ${table}\\s*\\(`, 'i'));
+    assert.ok(
+      tableAt > -1 && tableAt < indexAt,
+      `index on ${table} at offset ${indexAt} runs before its table is created (${tableAt})`
     );
   }
 });

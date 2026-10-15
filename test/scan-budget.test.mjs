@@ -11,10 +11,11 @@ import assert from 'node:assert/strict';
 import {
   mayRunExpensiveScan,
   resetScanBudget,
-  SCAN_BUDGET_PER_ISOLATE,
-  MIN_SCAN_LENGTH,
+  scanBudget,
   mayScanFor,
 } from '../worker/index.ts';
+
+const { perIsolate: SCAN_BUDGET_PER_ISOLATE, minLength: MIN_SCAN_LENGTH } = scanBudget();
 
 beforeEach(() => resetScanBudget());
 
