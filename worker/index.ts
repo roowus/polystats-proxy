@@ -635,6 +635,8 @@ async function ensureSchema(db: D1Database): Promise<void> {
     const lowerBackfilled = await db
       .prepare("SELECT value FROM meta WHERE key = 'nicklower_backfilled'")
       .first<{ value: string }>();
+    // 'failed' counts as done: retrying a full-table UPDATE per isolate is what
+    // spends the read budget. Only a missing row triggers the work.
     if (!lowerBackfilled) {
       await db.prepare("UPDATE users SET nickname_lower = lower(nickname) WHERE nickname_lower IS NULL AND nickname IS NOT NULL").run();
       await db.prepare("UPDATE user_names SET nickname_lower = lower(nickname) WHERE nickname_lower IS NULL AND nickname IS NOT NULL").run();
@@ -643,6 +645,13 @@ async function ensureSchema(db: D1Database): Promise<void> {
         .run();
     }
   } catch (err) {
+    // Mark the attempt so a failure cannot repeat on every cold isolate. The
+    // UPDATE scans every row in `users`, so retrying it per isolate is the same
+    // runaway cost as the FTS rebuild below.
+    await db
+      .prepare("INSERT INTO meta (key, value) VALUES ('nicklower_backfilled', 'failed') ON CONFLICT(key) DO UPDATE SET value = 'failed'")
+      .run()
+      .catch(() => {});
     console.error('nickname_lower backfill failed:', String(err));
   }
 
@@ -671,6 +680,12 @@ async function ensureSchema(db: D1Database): Promise<void> {
         .run();
     }
   } catch (err) {
+    // Same reasoning as above: a full-table INSERT ... SELECT retried on every
+    // cold isolate is a runaway read cost, so a failure is recorded once.
+    await db
+      .prepare("INSERT INTO meta (key, value) VALUES ('catalog_folded', 'failed') ON CONFLICT(key) DO UPDATE SET value = 'failed'")
+      .run()
+      .catch(() => {});
     console.error('catalog fold failed:', String(err));
   }
 
@@ -700,19 +715,48 @@ async function ensureSchema(db: D1Database): Promise<void> {
            )`
         )
         .run();
-      await db
-        .prepare(
-          `INSERT INTO users_fts (nickname_lower, user_id)
-           SELECT COALESCE(nickname_lower, lower(nickname)), user_id
-           FROM users WHERE nickname IS NOT NULL AND nickname <> ''`
-        )
-        .run();
+      // Only fill the index if it is actually empty.
+      //
+      // The INSERT below reads every row in `users`. Without this check, a
+      // partially built index is rebuilt from scratch on the next cold isolate.
+      const { results: counted } = await db
+        .prepare('SELECT COUNT(*) AS n FROM users_fts')
+        .all<{ n: number }>();
+      if ((counted?.[0]?.n ?? 0) === 0) {
+        await db
+          .prepare(
+            `INSERT INTO users_fts (nickname_lower, user_id)
+             SELECT COALESCE(nickname_lower, lower(nickname)), user_id
+             FROM users WHERE nickname IS NOT NULL AND nickname <> ''`
+          )
+          .run();
+      }
       await db
         .prepare("INSERT INTO meta (key, value) VALUES ('fts_ready', '1') ON CONFLICT(key) DO UPDATE SET value = '1'")
         .run();
     }
   } catch (err) {
-    // Leave fts_ready unset so the next boot retries; search falls back to LIKE.
+    // Record the attempt even when it fails.
+    //
+    // This block reads every row in `users`. Leaving the flag unset so "the next
+    // boot retries" is what exhausted the daily allowance: Workers are recycled
+    // constantly, and each new isolate read ~9,700 rows to try again. Around 515
+    // isolates was enough to spend the whole 5M budget — and once spent the
+    // rebuild could never succeed, so it kept retrying and kept failing. That is
+    // a runaway loop, not a one-time cost.
+    //
+    // Search falls back to the LIKE path when the flag is not '1', so failing
+    // once and staying failed is strictly better than failing repeatedly.
+    const { results: done } = await db
+      .prepare("SELECT value FROM meta WHERE key = 'fts_ready'")
+      .all<{ value: string }>()
+      .catch(() => ({ results: [] as { value: string }[] }));
+    if (done?.[0]?.value !== '1') {
+      await db
+        .prepare("INSERT INTO meta (key, value) VALUES ('fts_ready', 'failed') ON CONFLICT(key) DO UPDATE SET value = 'failed'")
+        .run()
+        .catch(() => {});
+    }
     console.error('FTS index unavailable, falling back to LIKE:', String(err));
   }
 

@@ -140,3 +140,29 @@ test('every dispatched cron covers all registered schedules', () => {
     'an unknown schedule should be reported rather than silently misrouted'
   );
 });
+
+test('a failed one-time migration is recorded, so it cannot retry forever', () => {
+  // The migrations that read whole tables (the FTS rebuild, the nickname_lower
+  // backfill, the catalog fold) are each gated on a flag in `meta`. Leaving that
+  // flag unset on failure meant every cold isolate retried the full read, which
+  // is what exhausted the daily row allowance: Workers recycle constantly, and
+  // each retry cost ~9,700 rows. They must record the attempt even when it fails.
+  const body = ensureSchemaBody();
+  for (const key of ['fts_ready', 'nicklower_backfilled', 'catalog_folded']) {
+    assert.ok(
+      body.includes(`'${key}', 'failed'`),
+      `${key} is not marked on failure, so a failing migration will retry on ` +
+        'every cold isolate and spend the read budget'
+    );
+  }
+});
+
+test('the FTS index is only filled when it is empty', () => {
+  // The fill reads every row in `users`; rebuilding it per isolate is the same
+  // runaway cost. It must check first.
+  const body = ensureSchemaBody();
+  assert.ok(
+    /SELECT COUNT\(\*\) AS n FROM users_fts/.test(body),
+    'the FTS fill does not check whether the index already has rows'
+  );
+});
