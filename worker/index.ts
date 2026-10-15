@@ -539,9 +539,15 @@ async function ensureSchema(db: D1Database): Promise<void> {
       end_time TEXT,
       first_seen TEXT NOT NULL DEFAULT (datetime('now'))
     )`),
-    // Indexed with COLLATE NOCASE: the search filters nickname_lower with LIKE,
-    // and SQLite can only use an index for LIKE when the collation matches.
-    db.prepare('CREATE INDEX IF NOT EXISTS idx_users_nicklower_nocase ON users(nickname_lower COLLATE NOCASE)'),
+    // NOTE: the index on users(nickname_lower) is deliberately NOT here.
+    //
+    // That column is added by the ALTER TABLE migration further down, so creating
+    // the index at this point failed with "no such column: nickname_lower" on any
+    // database where the migration had not yet run. The statement sat outside a
+    // try/catch, so the exception escaped ensureSchema — which gates nearly every
+    // route and only sets `schemaReady` on its last line — and every request to
+    // the worker returned 500 until it was fixed. The index is now created after
+    // the column, below.
     db.prepare('CREATE INDEX IF NOT EXISTS idx_snapshots_user ON snapshots(user_id)'),
   ];
   for (let i = 0; i < ddl.length; i++) {
@@ -564,21 +570,42 @@ async function ensureSchema(db: D1Database): Promise<void> {
       // duplicate column — already applied
     }
   }
+
+  // Index on the column the migration above adds.
+  //
+  // Indexed with COLLATE NOCASE: search filters nickname_lower with LIKE, and
+  // SQLite can only use an index for LIKE when the collation matches. This has to
+  // run AFTER the ALTER TABLE, not with the other DDL.
+  try {
+    await db
+      .prepare('CREATE INDEX IF NOT EXISTS idx_users_nicklower_nocase ON users(nickname_lower COLLATE NOCASE)')
+      .run();
+  } catch (err) {
+    // Non-fatal: search falls back to a full scan without the index.
+    console.error('users nickname_lower index unavailable:', String(err));
+  }
   // Backfill lowercase values for rows migrated before the column existed.
   //
   // Gated on a meta flag rather than run unconditionally: the UPDATE has to
   // inspect every row to find the ones needing work, so on a cold start it cost
   // a full table scan even once it had nothing left to do. Workers recycle
   // isolates often, which turned a one-time migration into a recurring cost.
-  const lowerBackfilled = await db
-    .prepare("SELECT value FROM meta WHERE key = 'nicklower_backfilled'")
-    .first<{ value: string }>();
-  if (!lowerBackfilled) {
-    await db.prepare("UPDATE users SET nickname_lower = lower(nickname) WHERE nickname_lower IS NULL AND nickname IS NOT NULL").run();
-    await db.prepare("UPDATE user_names SET nickname_lower = lower(nickname) WHERE nickname_lower IS NULL AND nickname IS NOT NULL").run();
-    await db
-      .prepare("INSERT INTO meta (key, value) VALUES ('nicklower_backfilled', '1') ON CONFLICT(key) DO UPDATE SET value = '1'")
-      .run();
+  //
+  // Wrapped because a failure here is cosmetic (search matches on the wrong case)
+  // whereas an unhandled throw is fatal to every route.
+  try {
+    const lowerBackfilled = await db
+      .prepare("SELECT value FROM meta WHERE key = 'nicklower_backfilled'")
+      .first<{ value: string }>();
+    if (!lowerBackfilled) {
+      await db.prepare("UPDATE users SET nickname_lower = lower(nickname) WHERE nickname_lower IS NULL AND nickname IS NOT NULL").run();
+      await db.prepare("UPDATE user_names SET nickname_lower = lower(nickname) WHERE nickname_lower IS NULL AND nickname IS NOT NULL").run();
+      await db
+        .prepare("INSERT INTO meta (key, value) VALUES ('nicklower_backfilled', '1') ON CONFLICT(key) DO UPDATE SET value = '1'")
+        .run();
+    }
+  } catch (err) {
+    console.error('nickname_lower backfill failed:', String(err));
   }
 
   // Indexes on migrated columns go AFTER the columns exist.
@@ -587,25 +614,26 @@ async function ensureSchema(db: D1Database): Promise<void> {
   } catch {
     // index already exists
   }
+  // One-time fold: legacy catalog rows -> users.save_count, then drop the old
+  // table. Guarded: the catalog table may not exist on a database created after
+  // the fold, and an unhandled throw here would take the worker down.
   try {
-    await db.prepare('CREATE INDEX IF NOT EXISTS idx_user_names_nicklower ON user_names(nickname_lower COLLATE NOCASE)').run();
-  } catch {
-    // index already exists
-  }
-  // One-time fold: legacy catalog rows -> users.save_count, then drop the old table.
-  const folded = await db.prepare("SELECT value FROM meta WHERE key = 'catalog_folded'").first<{ value: string }>();
-  if (!folded) {
-    await db
-      .prepare(
-        `INSERT INTO users (user_id, save_count)
-         SELECT user_id, saved_count FROM catalog WHERE true
-         ON CONFLICT(user_id) DO UPDATE SET save_count = MAX(users.save_count, excluded.save_count)`
-      )
-      .run();
-    await db.prepare('DROP TABLE IF EXISTS catalog').run();
-    await db
-      .prepare("INSERT INTO meta (key, value) VALUES ('catalog_folded', '1') ON CONFLICT(key) DO UPDATE SET value = '1'")
-      .run();
+    const folded = await db.prepare("SELECT value FROM meta WHERE key = 'catalog_folded'").first<{ value: string }>();
+    if (!folded) {
+      await db
+        .prepare(
+          `INSERT INTO users (user_id, save_count)
+           SELECT user_id, saved_count FROM catalog WHERE true
+           ON CONFLICT(user_id) DO UPDATE SET save_count = MAX(users.save_count, excluded.save_count)`
+        )
+        .run();
+      await db.prepare('DROP TABLE IF EXISTS catalog').run();
+      await db
+        .prepare("INSERT INTO meta (key, value) VALUES ('catalog_folded', '1') ON CONFLICT(key) DO UPDATE SET value = '1'")
+        .run();
+    }
+  } catch (err) {
+    console.error('catalog fold failed:', String(err));
   }
 
   // Full-text index for player search.
@@ -1160,12 +1188,24 @@ export default {
         const db = env.DB;
         if (!db) return;
         await ensureSchema(db);
-        if (controller.cron === '*/15 * * * *') {
+        // These must match the `crons` list in wrangler.toml exactly.
+        //
+        // They previously did not: the watch was dispatched on '*/15 * * * *',
+        // which is not a registered schedule, so the 5-minute WR watch never ran
+        // and both backfill crons fell through to runSnapshot. No record falls or
+        // backfill coverage were collected for as long as that mismatch lasted,
+        // silently, because the default branch looks like a valid job.
+        if (controller.cron === '*/5 * * * *') {
           await wrWatch(db);
         } else if (controller.cron === '0 3 * * *' || controller.cron === '0 15 * * *') {
           await runBackfill(db);
-        } else {
+        } else if (controller.cron === '0 */6 * * *') {
           await runSnapshot(db);
+        } else {
+          // An unrecognised schedule means wrangler.toml and this dispatch have
+          // drifted apart again, which is how the watch went missing. Say so
+          // rather than quietly running the wrong job.
+          console.error(`unrecognised cron schedule: ${controller.cron}`);
         }
       })()
     );
