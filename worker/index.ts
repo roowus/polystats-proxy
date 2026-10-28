@@ -517,6 +517,12 @@ async function ensureSchema(db: D1Database): Promise<void> {
       recording TEXT,
       UNIQUE(track_id, player, time_ms, set_at)
     )`),
+    // Serves the WR watch's per-track lookup,
+    //   SELECT MIN(time_ms) AS t FROM wr_history WHERE track_id = ?1
+    // which runs ~45 times per 5-minute job. With (track_id, time_ms) this is a
+    // single covering-index seek: the minimum is the first entry for the track.
+    // It also serves the per-track history listing, ORDER BY set_at, as a seek
+    // plus a small sort. Without it both would read every row in the table.
     db.prepare('CREATE INDEX IF NOT EXISTS idx_history_track ON wr_history(track_id, time_ms)'),
     db.prepare(`CREATE TABLE IF NOT EXISTS users (
       user_id TEXT PRIMARY KEY,
@@ -587,6 +593,23 @@ async function ensureSchema(db: D1Database): Promise<void> {
     // Declared here, after the users table above, for the same reason the
     // nickname_lower index is created after its ALTER.
     db.prepare('CREATE INDEX IF NOT EXISTS idx_users_save_count ON users(save_count DESC, last_seen DESC)'),
+    // `results` is keyed (track_id, user_id), so the player-stats page's
+    //   WHERE user_id = ? ORDER BY time_ms ASC
+    // cannot use the primary key at all: track_id is the leading column. It was
+    // scanning every result row per profile view, plus a temp B-tree sort.
+    // (user_id, time_ms) turns it into a seek and the ordering comes free.
+    db.prepare('CREATE INDEX IF NOT EXISTS idx_results_user ON results(user_id, time_ms)'),
+    // The uncapped player list is
+    //   SELECT ... FROM users ORDER BY last_seen DESC LIMIT ?
+    // which scanned `users` and sorted it in a temp B-tree on each call.
+    db.prepare('CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen DESC)'),
+    // The recordings backfill looks for rows still missing their recording:
+    //   WHERE recording IS NULL AND entry_id IS NOT NULL LIMIT 10
+    // A partial index holds only those rows, so it stays small while the table
+    // grows (recordings get filled in over time and drop out of the index).
+    db.prepare(
+      'CREATE INDEX IF NOT EXISTS idx_history_pending ON wr_history(entry_id) WHERE recording IS NULL AND entry_id IS NOT NULL'
+    ),
   ];
   for (let i = 0; i < ddl.length; i++) {
     try {
