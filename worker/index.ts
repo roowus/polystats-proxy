@@ -603,13 +603,14 @@ async function ensureSchema(db: D1Database): Promise<void> {
     //   SELECT ... FROM users ORDER BY last_seen DESC LIMIT ?
     // which scanned `users` and sorted it in a temp B-tree on each call.
     db.prepare('CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen DESC)'),
-    // The recordings backfill looks for rows still missing their recording:
-    //   WHERE recording IS NULL AND entry_id IS NOT NULL LIMIT 10
-    // A partial index holds only those rows, so it stays small while the table
-    // grows (recordings get filled in over time and drop out of the index).
-    db.prepare(
-      'CREATE INDEX IF NOT EXISTS idx_history_pending ON wr_history(entry_id) WHERE recording IS NULL AND entry_id IS NOT NULL'
-    ),
+    // NOTE: the index for the pending-recordings lookup is NOT here.
+    //
+    // It covers wr_history(entry_id), but `entry_id` is not part of that table's
+    // CREATE TABLE and is not added by any ALTER either: it exists on databases
+    // where it was added by hand. Creating the index in this list threw "no such
+    // column: entry_id" on a database without it, and because this loop runs
+    // inside ensureSchema every request returned 500. It is created further down
+    // behind a column check instead.
   ];
   for (let i = 0; i < ddl.length; i++) {
     try {
@@ -645,6 +646,29 @@ async function ensureSchema(db: D1Database): Promise<void> {
     // Non-fatal: search falls back to a full scan without the index.
     console.error('users nickname_lower index unavailable:', String(err));
   }
+  // Index for the pending-recordings lookup:
+  //   SELECT rowid, track_id, entry_id FROM wr_history
+  //   WHERE recording IS NULL AND entry_id IS NOT NULL LIMIT 10
+  // which otherwise scans the whole table. A partial index holds only the rows
+  // still missing a recording, so it shrinks as the backfill fills them in.
+  //
+  // `entry_id` is not declared in the wr_history CREATE TABLE and no ALTER adds
+  // it, so it may legitimately be missing. Check first: creating this index blind
+  // threw "no such column: entry_id" inside ensureSchema, which gated every route
+  // and took the whole worker down. Failure here is only a lost optimisation.
+  try {
+    const cols = await db.prepare('PRAGMA table_info(wr_history)').all<{ name: string }>();
+    if ((cols.results ?? []).some((c) => c.name === 'entry_id')) {
+      await db
+        .prepare(
+          'CREATE INDEX IF NOT EXISTS idx_history_pending ON wr_history(entry_id) WHERE recording IS NULL AND entry_id IS NOT NULL'
+        )
+        .run();
+    }
+  } catch (err) {
+    console.error('wr_history pending index unavailable:', String(err));
+  }
+
   // Backfill lowercase values for rows migrated before the column existed.
   //
   // Gated on a meta flag rather than run unconditionally: the UPDATE has to

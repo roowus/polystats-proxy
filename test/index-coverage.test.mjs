@@ -48,12 +48,41 @@ test('users is indexed for the uncapped last_seen listing', () => {
   assert.match(source, /FROM users ORDER BY last_seen DESC LIMIT \?1/, 'the listing query should still match this index');
 });
 
-test('the pending-recordings lookup has a partial index', () => {
-  // The backfill asks for rows with no recording yet. Filled rows drop out of the
-  // index, so it stays small as wr_history grows.
-  const idx = indexes().find((i) => i.table === 'wr_history' && /entry_id/.test(i.columns));
-  assert.ok(idx, 'expected an index on wr_history(entry_id ...)');
-  assert.match(source, /WHERE recording IS NULL AND entry_id IS NOT NULL/, 'partial index should mirror the query predicate');
+test('the pending-recordings index is created behind a column check', () => {
+  // This index caused an outage: `entry_id` is not in the wr_history CREATE TABLE
+  // and no ALTER adds it, so creating the index in the main DDL list threw
+  // "no such column: entry_id" inside ensureSchema, which gates every route.
+  // It must therefore be guarded by a PRAGMA check and must not sit in the DDL
+  // array with the other indexes.
+  assert.match(
+    source,
+    /PRAGMA table_info\(wr_history\)/,
+    'entry_id index must verify the column exists first'
+  );
+  assert.match(
+    source,
+    /name === 'entry_id'/,
+    'the guard should check specifically for entry_id'
+  );
+  assert.match(source, /idx_history_pending ON wr_history\(entry_id\)/, 'index should still be created');
+  assert.match(source, /WHERE recording IS NULL AND entry_id IS NOT NULL/, 'and keep its partial predicate');
+
+  // It must not appear as an executable statement in the unguarded DDL array:
+  // that array runs before the column check, which is what broke. Match only
+  // db.prepare(...) call sites, not the explanatory comment that mentions it.
+  const executable = [...source.matchAll(/db\s*\.\s*prepare\(\s*['"`](CREATE INDEX[^'"`]*?)['"`]/g)]
+    .map((m) => m[1])
+    .filter((sql) => /idx_history_pending/.test(sql));
+  for (const sql of executable) {
+    // Any occurrence must be the guarded one, which is built with a template or
+    // appears after the PRAGMA check in source order.
+    const at = source.indexOf(sql);
+    const pragmaAt = source.indexOf('PRAGMA table_info(wr_history)');
+    assert.ok(
+      at > pragmaAt,
+      'idx_history_pending must only be created after the PRAGMA column check'
+    );
+  }
 });
 
 test('the per-track MIN query is served by the existing history index', () => {
