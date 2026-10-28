@@ -60,7 +60,8 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 /** WR watch: cheap — writes only when a record actually falls. Chunked to respect subrequest limits. */
-async function wrWatch(db: D1Database): Promise<void> {
+/** Returns how many new WR rows were written, so the caller can skip a recount. */
+async function wrWatch(db: D1Database): Promise<{ rowsChanged: number }> {
   await ensureSchema(db);
   const CHUNK = 45; // free plan: max 50 subrequests per invocation
   const watchCursor = await db
@@ -115,6 +116,7 @@ async function wrWatch(db: D1Database): Promise<void> {
     .bind(new Date().toISOString())
     .run();
   if (broken > 0) console.log(`WR watch: ${broken} record(s) broken`);
+  return { rowsChanged: broken };
 }
 
 async function setWatchCursor(db: D1Database, value: number): Promise<void> {
@@ -128,16 +130,17 @@ async function setWatchCursor(db: D1Database, value: number): Promise<void> {
 }
 
 /** Full top-50 snapshot of every track + TOTW archive. */
-async function runSnapshot(db: D1Database): Promise<void> {
-  await snapshotLeaderboards(db);
+async function runSnapshot(db: D1Database): Promise<{ rowsChanged: number }> {
+  const written = await snapshotLeaderboards(db);
   await db
     .prepare("INSERT INTO meta (key, value) VALUES ('last_fresh_run', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1")
     .bind(new Date().toISOString())
     .run();
+  return { rowsChanged: written };
 }
 
 /** Daily backfill: deep-crawl the long tail. */
-async function runBackfill(db: D1Database): Promise<void> {
+async function runBackfill(db: D1Database): Promise<{ rowsChanged: number }> {
   await ensureSchema(db);
   const cursor = await getCursor(db);
   const seen = await backfillTracks(db, cursor);
@@ -146,6 +149,7 @@ async function runBackfill(db: D1Database): Promise<void> {
     .bind(new Date().toISOString())
     .run();
   console.log(`backfill pass done: cursor ${cursor}, ${seen} results seen`);
+  return { rowsChanged: seen };
 }
 
 /**
@@ -243,10 +247,22 @@ async function handleRun(request: Request, url: URL, env: Env): Promise<Response
     return jsonResponse({ ok: true, skipped: true, reason: 'ran recently', last_run: last.value });
   }
 
+  let rowsChanged = 0;
   try {
-    if (job === 'watch') await wrWatch(db);
-    else if (job === 'snapshot') await runSnapshot(db);
-    else await runBackfill(db);
+    if (job === 'watch') rowsChanged = (await wrWatch(db)).rowsChanged;
+    else if (job === 'snapshot') rowsChanged = (await runSnapshot(db)).rowsChanged;
+    else rowsChanged = (await runBackfill(db)).rowsChanged;
+
+    // Drain a few queued profile refreshes on every run. This is the only place
+    // client-requested refreshes turn into writes, and the values come from the
+    // API, never from the request that queued them.
+    let refreshed = 0;
+    try {
+      refreshed = (await processRefreshQueue(db, 5)).updated;
+    } catch (e) {
+      console.error('refresh queue drain failed:', String(e));
+    }
+    rowsChanged += refreshed;
   } catch (e) {
     return jsonResponse({ error: String(e), stack: e instanceof Error ? e.stack : null }, 500);
   }
@@ -254,10 +270,14 @@ async function handleRun(request: Request, url: URL, env: Env): Promise<Response
     .prepare("INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2")
     .bind(key, new Date().toISOString())
     .run();
-  // Jobs are the only thing that changes row counts, so refresh the cached
-  // values here rather than making every /status call count rows.
-  await recordCounts(db).catch(() => {});
-  return jsonResponse({ ok: true, job });
+  // Refresh the cached counts ONLY when this run actually changed rows.
+  //
+  // Each recordCounts() call runs COUNT(*) over five tables, which visits every
+  // row: ~26,000 reads. watch and tick fire every 5 minutes (576 runs/day) and
+  // usually change nothing, so calling it unconditionally spent ~15M reads/day
+  // against a 5M allowance and was the single largest read cost in the worker.
+  if (rowsChanged > 0) await recordCounts(db).catch(() => {});
+  return jsonResponse({ ok: true, job, rowsChanged });
 }
 
 interface RecordingEntry {
@@ -544,6 +564,24 @@ async function ensureSchema(db: D1Database): Promise<void> {
     db.prepare(`CREATE TABLE IF NOT EXISTS meta (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
+    )`),
+    // Refresh queue.
+    //
+    // The site used to PUT { nickname, carStyle } straight into `users` when
+    // someone loaded a profile. The only guard was the Origin header, which any
+    // script can set, so anyone could overwrite any player's record.
+    //
+    // Now the client can only ASK for a refresh: it names a user_id it believes
+    // may be stale and sends nothing else. A worker then fetches that player from
+    // the PolyTrack API and writes the authoritative values, so what lands in D1
+    // always came from the API rather than from the request.
+    //
+    // One row per user_id, so repeated asks collapse instead of queueing work.
+    db.prepare(`CREATE TABLE IF NOT EXISTS refresh_queue (
+      user_id TEXT PRIMARY KEY,
+      requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT
     )`),
     db.prepare(`CREATE TABLE IF NOT EXISTS user_names (
       user_id TEXT NOT NULL,
@@ -983,6 +1021,112 @@ const ALL_TRACK_IDS: [string, string][] = [
   ['Snow Park', '191737cc4d1b74949e992d99371e5c7f5fc446a716af571c6e5449b23e9f4558'],
   ['concrete jungle', '39bd3fa6c3c769b298c219aee7561af35a6d856bfee14b46b0b48499e7a57ed5'],
 ];
+/**
+ * Drain the refresh queue: re-read players from the PolyTrack API and write the
+ * authoritative values into D1.
+ *
+ * Clients can only ask for a user_id to be refreshed; every value written here
+ * comes from a response we fetched ourselves, so a forged request can name a
+ * player but cannot dictate what is stored about them.
+ *
+ * `/v6/user` is not usable for this: it expects a player's secret token, not the
+ * public user_id, and returns null for a userId. The leaderboard endpoints are
+ * public and carry the same nickname and carStyle, so the reliable way to resolve
+ * a user_id is to find a board the player appears on.
+ *
+ * Bounded per call so one invocation stays inside the subrequest limit; the rest
+ * stay queued for the next run.
+ */
+async function processRefreshQueue(db: D1Database, batchSize = 5): Promise<{ processed: number; updated: number }> {
+  const { results } = await db
+    .prepare('SELECT user_id, attempts FROM refresh_queue ORDER BY requested_at ASC LIMIT ?1')
+    .bind(batchSize)
+    .all<{ user_id: string; attempts: number }>();
+  const pending = results ?? [];
+  if (pending.length === 0) return { processed: 0, updated: 0 };
+
+  let updated = 0;
+  for (const row of pending) {
+    const userId = row.user_id;
+    try {
+      const found = await resolveUserFromLeaderboards(userId);
+      if (found) {
+        await db.batch(
+          userUpsertStatements(db, userId, found.nickname, found.carStyle, null)
+        );
+        updated += 1;
+        // Done: the player's authoritative fields are now stored.
+        await db.prepare('DELETE FROM refresh_queue WHERE user_id = ?1').bind(userId).run();
+      } else {
+        // Not on any board we checked. Retry a few times, then give up so a
+        // nonexistent or unlisted id cannot sit in the queue forever.
+        const attempts = row.attempts + 1;
+        if (attempts >= 3) {
+          await db.prepare('DELETE FROM refresh_queue WHERE user_id = ?1').bind(userId).run();
+        } else {
+          await db
+            .prepare('UPDATE refresh_queue SET attempts = ?1, last_error = ?2 WHERE user_id = ?3')
+            .bind(attempts, 'not found on sampled leaderboards', userId)
+            .run();
+        }
+      }
+    } catch (e) {
+      await db
+        .prepare('UPDATE refresh_queue SET attempts = attempts + 1, last_error = ?1 WHERE user_id = ?2')
+        .bind(String(e).slice(0, 200), userId)
+        .run()
+        .catch(() => {});
+    }
+  }
+  return { processed: pending.length, updated };
+}
+
+/**
+ * Find a player's current nickname and car style from public leaderboards.
+ *
+ * Walks a few tracks until one has this user. `leaderboardUserEntry` answers
+ * "does this player appear here, and at what position", and the board itself
+ * carries the display fields, so no secret token is involved.
+ */
+async function resolveUserFromLeaderboards(
+  userId: string
+): Promise<{ nickname: string | null; carStyle: string | null } | null> {
+  // Rotate the starting track so repeated refreshes sample different boards
+  // instead of always walking the same prefix.
+  const start = parseInt(userId.slice(0, 4), 16) % ALL_TRACK_IDS.length;
+  for (let i = 0; i < Math.min(6, ALL_TRACK_IDS.length); i++) {
+    const [, trackId] = ALL_TRACK_IDS[(start + i) % ALL_TRACK_IDS.length];
+    try {
+      const entryRes = await fetch(
+        `https://vps.kodub.com/v6/leaderboardUserEntry?version=${API_VERSION}&trackId=${trackId}&userTokenHash=${encodeURIComponent(userId)}&onlyVerified=false`,
+        { headers: { Origin: GAME_ORIGIN } }
+      );
+      if (!entryRes.ok) continue;
+      const entry = (await entryRes.json()) as { position?: number } | null;
+      if (!entry?.position) continue;
+
+      // The player is on this board. Read the row at that position for the
+      // authoritative display fields.
+      const skip = Math.max(0, entry.position - 1);
+      const boardRes = await fetch(
+        `https://vps.kodub.com/v6/leaderboard?version=${API_VERSION}&trackId=${trackId}&skip=${skip}&amount=1&onlyVerified=false`,
+        { headers: { Origin: GAME_ORIGIN } }
+      );
+      if (!boardRes.ok) continue;
+      const board = (await boardRes.json()) as {
+        entries?: { userId?: string; nickname?: string; carStyle?: string }[];
+      };
+      const match = (board.entries ?? []).find((e) => e.userId === userId);
+      if (match) {
+        return { nickname: match.nickname ?? null, carStyle: match.carStyle ?? null };
+      }
+    } catch {
+      // try the next track
+    }
+  }
+  return null;
+}
+
 
 const SNAPSHOT_DEPTH = 50; // top N players per track per run (fresh data)
 const BACKFILL_TRACKS_PER_RUN = 6; // rotating window: full sweep every ~3 runs
@@ -1090,8 +1234,10 @@ async function backfillTracks(db: D1Database, cursor: number): Promise<number> {
  * Appends a history row only when the #1 time improved (WR history),
  * and upserts every seen player into the users table.
  */
-async function snapshotLeaderboards(db: D1Database): Promise<void> {
+async function snapshotLeaderboards(db: D1Database): Promise<number> {
   await ensureSchema(db);
+  // Total statements written, used to decide whether row counts need refreshing.
+  let written = 0;
 
   // Archive the current Track of the Week (metadata + its top 50)
   try {
@@ -1214,11 +1360,13 @@ async function snapshotLeaderboards(db: D1Database): Promise<void> {
         );
       }
       await db.batch(statements);
+      written += statements.length;
     } catch (e) {
       // one track failing must not kill the run
       console.error(`snapshot failed for ${trackName}:`, e);
     }
   }
+  return written;
 }
 
 /** Player catalog endpoints (backed by D1; 503 when the binding is absent). */
@@ -1241,12 +1389,18 @@ async function handleCatalog(request: Request, url: URL, env: Env): Promise<Resp
   }
 
   if (request.method === 'PUT') {
-    // Upsert a player profile (called when PolyStats users look someone up).
+    // Request a refresh of one player.
+    //
+    // This deliberately accepts ONLY a user_id. The previous version also took
+    // `nickname` and `carStyle` from the body and wrote them straight into
+    // `users`, guarded only by the Origin header, so any caller could overwrite
+    // any player's data. Values now come from the PolyTrack API in
+    // processRefreshQueue, never from the request.
     const origin = request.headers.get('Origin') ?? '';
     if (!WRITE_ORIGINS.has(origin)) {
       return jsonResponse({ error: 'writes from this origin are not allowed' }, 403);
     }
-    let body: { userId?: string; nickname?: string; carStyle?: string; countryCode?: string };
+    let body: { userId?: string };
     try {
       body = (await request.json()) as typeof body;
     } catch {
@@ -1255,9 +1409,15 @@ async function handleCatalog(request: Request, url: URL, env: Env): Promise<Resp
     if (!body.userId || !/^[a-f0-9]{64}$/.test(body.userId)) {
       return jsonResponse({ error: 'userId must be a 64-char hex string' }, 400);
     }
-    await ensureSchema(db);
-    await db.batch(userUpsertStatements(db, body.userId, body.nickname ?? null, body.carStyle ?? null, body.countryCode ?? null));
-    return jsonResponse({ ok: true });
+    if (!env.DB) return jsonResponse({ error: 'users unavailable: D1 binding missing' }, 503);
+    await ensureSchema(env.DB);
+    // INSERT OR IGNORE keeps one pending row per player, so a client that asks
+    // repeatedly cannot grow the queue or spend the write budget.
+    await env.DB
+      .prepare("INSERT OR IGNORE INTO refresh_queue (user_id) VALUES (?1)")
+      .bind(body.userId)
+      .run();
+    return jsonResponse({ ok: true, queued: true });
   }
 
   if (request.method === 'DELETE') {
